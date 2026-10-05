@@ -1,5 +1,8 @@
+import { UI_LANGUAGES } from '../shared/ui-language.js';
 import { REASONING_EFFORTS } from '../shared/session.js';
 import { appearanceSchema } from './appearance-schema.js';
+import { BROWSER_BRIDGE_PORTS } from '../shared/browser-bridge.js';
+import { CONNECTOR_SUFFIX_MAX, CONNECTOR_SUFFIX_PATTERN } from '../shared/connector-names.js';
 /**
  * Non-secret settings, stored as one small JSON file in the app's userData folder.
  * No database: there are at most a handful of roots and a dozen booleans.
@@ -38,9 +41,17 @@ import {
   SUPERSEDED_GOAL_OBJECTIVE_SYSTEM_PROMPTS,
   SUPERSEDED_GOAL_SYSTEM_PROMPTS
 } from '../shared/goal.js';
+import { DEFAULT_HANDOFF_LENGTH, DEFAULT_HANDOFF_PROMPT, HANDOFF_LENGTHS, MAX_HANDOFF_PROMPT_CHARS } from '../shared/handoff.js';
 import { logError } from './logger.js';
 import { RESERVED_ROOT_NAMES } from './sandbox.js';
 import { capabilitiesForPlatform } from './platform.js';
+import {
+  MAX_COMMAND_ALLOWLIST_RULES,
+  MAX_COMMAND_ALLOWLIST_RULE_CHARS,
+  validateCommandAllowlistRule
+} from '../shared/command-allowlist.js';
+
+export const browserBridgePortSchema = z.union([z.literal('auto'), z.literal(BROWSER_BRIDGE_PORTS)]);
 
 /**
  * Defaults for the newer sections, in one place so the schema and defaultConfig()
@@ -112,7 +123,9 @@ const DEFAULT_COMPACTION: CompactionSettings = {
   // the crossing turn still finishes and still writes its handoff, rather than the app
   // waiting for a chat that is already over the line and compacting it on sight.
   auto: true,
-  autoTokens: DEFAULT_SESSIONS.advisoryTokens
+  autoTokens: DEFAULT_SESSIONS.advisoryTokens,
+  handoffPrompt: DEFAULT_HANDOFF_PROMPT,
+  handoffLength: DEFAULT_HANDOFF_LENGTH
 };
 /**
  * The goal loop's defaults.
@@ -152,10 +165,20 @@ const DEFAULT_GOAL: GoalSettings = {
 const DEFAULT_MULTI_AGENT: MultiAgentSettings = {
   enabled: false,
   maxWorkers: 2,
+  // Preserve the historical behavior unless the user explicitly opts into a cap shared by
+  // independent prime families. Existing per-family maxWorkers remains authoritative too.
+  globalMaxWorkers: 0,
   allowUnattributedCalls: false,
+  strictChatAllowlist: false,
   // Off: Goal/Loop chats are always recovered, and reopening anything else — a worker, a prime,
   // a plain chat that once called a tool — is the user's choice to make.
-  recoverAgentTabs: false
+  recoverAgentTabs: false,
+  // Off: waiting for a run's own workers before its next automatic step is a deliberate choice.
+  // A chat that delegated nothing, and a chat with no run, never wait either way.
+  waitForSubAgents: false,
+  // Off: ending an OS process is a real side effect even though the worker identity survives.
+  // The user must opt in before sleeping-worker runtime maintenance can terminate anything.
+  endSleepingWorkerProcesses: false
 };
 /** Fresh-install exposure. Kept separate from migration defaults on purpose. */
 const ALL_FIRST_LAUNCH_CAPABILITIES: Capabilities = Object.fromEntries(
@@ -249,6 +272,13 @@ const capabilitiesSchema = z
  */
 export const MAX_MCP_INSTRUCTIONS_CHARS = 4000;
 const DEFAULT_MCP = { instructions: '' } as const;
+/** Off for fresh installs and for every config written before the switches existed. */
+const DEFAULT_CONTROL_API = { enabled: false, allowActions: false } as const;
+const DEFAULT_COMMAND_ALLOWLIST = { enabled: false, mode: 'allow', rules: [] } as const;
+const commandAllowlistRuleSchema = z.string().max(MAX_COMMAND_ALLOWLIST_RULE_CHARS).superRefine((rule, ctx) => {
+  const message = validateCommandAllowlistRule(rule);
+  if (message) ctx.addIssue({ code: 'custom', message });
+});
 
 const configSchema = z.object({
   // A config written by hand — or by a build before `/skills` was reserved — must not be
@@ -260,6 +290,11 @@ const configSchema = z.object({
     .transform(uniqueStoredRoots),
   capabilities: capabilitiesSchema,
   readOnly: z.boolean(),
+  commandAllowlist: z.object({
+    enabled: z.boolean(),
+    mode: z.enum(['allow', 'deny']).optional().default('allow'),
+    rules: z.array(commandAllowlistRuleSchema).max(MAX_COMMAND_ALLOWLIST_RULES)
+  }).optional().default({ ...DEFAULT_COMMAND_ALLOWLIST, rules: [] }),
   tunnel: z.object({
     profileId: z.string().min(1).max(64).optional(),
     profileName: z.string().trim().min(1).max(80).optional(),
@@ -273,6 +308,8 @@ const configSchema = z.object({
     pluginsTunnelId: z.string().max(128).optional().default(''),
     binaryPath: z.string().max(4096)
   }),
+  // A damaged value falls back to the plain names instead of failing the whole file.
+  connectorSuffix: z.string().trim().max(CONNECTOR_SUFFIX_MAX).regex(CONNECTOR_SUFFIX_PATTERN).optional().catch(undefined),
   setupProfiles: z.array(z.object({
     id: z.string().min(1).max(64), name: z.string().trim().min(1).max(80),
     tunnelId: z.string().max(128), desktopTunnelId: z.string().max(128), pluginsTunnelId: z.string().max(128)
@@ -280,15 +317,26 @@ const configSchema = z.object({
   ui: z.object({
     appearance: appearanceSchema.optional().catch(undefined),
     autoContinue: z.boolean().optional().default(true),
+    defaultChatModel: z.string().trim().min(1).max(80).optional().catch(undefined),
+    defaultChatReasoning: z.enum(REASONING_EFFORTS).optional().catch(undefined),
     chatBrowser: z.enum(CHAT_BROWSERS).optional().default('chrome'),
     developerMode: z.boolean().optional(),
+    playfulStatus: z.boolean().optional(),
+    /** Keep the chat at its end while it grows, in the app and on ChatGPT, until the reader scrolls up. */
+    followOutput: z.boolean().optional().default(true),
+    mentionCore: z.boolean().optional().default(true),
+    language: z.enum(UI_LANGUAGES).optional(),
+    browserPreferences: z.object({ overwrite: z.boolean(), durations: z.boolean() }).strict().optional(),
+    cosBrowserTrayHint: z.boolean().optional(),
     finishTool: z.boolean().optional(),
     planBackend: z.enum(['chatgpt', 'api']).optional(),
     finishAction: z.enum(['notify', 'goal']).optional(),
     finishLeadMinutes: z.number().int().min(3).max(5).optional(),
     backgroundChats: z.boolean().optional().default(true),
+    browserBridgePort: browserBridgePortSchema.optional().default('auto'),
     browserOnly: z.boolean().optional().default(false),
     autoRefreshPlugins: z.boolean().optional().default(false),
+    autoSelectSkills: z.boolean().optional().default(false),
     tabsToKeepOpen: z.number().int().min(1).max(50).optional(),
     minimizeToTray: z.boolean(),
     autoConnect: z.boolean(),
@@ -332,21 +380,45 @@ const configSchema = z.object({
         .min(10_000)
         .max(4_000_000)
         .optional()
-        .default(DEFAULT_COMPACTION.autoTokens)
+        .default(DEFAULT_COMPACTION.autoTokens),
+      // Existing configs predate this editor. Blank/oversized hand edits recover to the
+      // shipped content policy; protocol framing remains outside this user-authored field.
+      handoffPrompt: z
+        .string()
+        .max(MAX_HANDOFF_PROMPT_CHARS)
+        .optional()
+        .default(DEFAULT_COMPACTION.handoffPrompt)
+        .transform((prompt) => prompt.trim() === '' ? DEFAULT_COMPACTION.handoffPrompt : prompt.trim())
+        .catch(DEFAULT_COMPACTION.handoffPrompt),
+      // Absent in every config before 2.1.27: those keep the shipped 10k–30k brief.
+      handoffLength: z.enum(HANDOFF_LENGTHS).optional().default(DEFAULT_HANDOFF_LENGTH).catch(DEFAULT_HANDOFF_LENGTH)
     })
     .optional()
-    .default({ ...DEFAULT_COMPACTION }),
+    .default({ ...DEFAULT_COMPACTION, handoffLength: DEFAULT_HANDOFF_LENGTH }),
   multiAgent: z
     .object({
       enabled: z.boolean().optional().default(DEFAULT_MULTI_AGENT.enabled),
     defaultModel: z.string().max(80).optional(),
     defaultReasoning: z.enum(['', ...REASONING_EFFORTS]).optional(),
       maxWorkers: z.number().int().min(1).max(8).optional().default(DEFAULT_MULTI_AGENT.maxWorkers),
+      globalMaxWorkers: z.number().int().min(0).max(64).optional().default(DEFAULT_MULTI_AGENT.globalMaxWorkers ?? 0),
       allowUnattributedCalls: z.boolean().optional().default(DEFAULT_MULTI_AGENT.allowUnattributedCalls),
-      recoverAgentTabs: z.boolean().optional().default(DEFAULT_MULTI_AGENT.recoverAgentTabs)
+      strictChatAllowlist: z.boolean().optional().default(DEFAULT_MULTI_AGENT.strictChatAllowlist ?? false),
+      recoverAgentTabs: z.boolean().optional().default(DEFAULT_MULTI_AGENT.recoverAgentTabs),
+      waitForSubAgents: z.boolean().optional().default(DEFAULT_MULTI_AGENT.waitForSubAgents ?? false),
+      endSleepingWorkerProcesses: z.boolean().optional().default(DEFAULT_MULTI_AGENT.endSleepingWorkerProcesses ?? false)
     })
     .optional()
-    .default({ ...DEFAULT_MULTI_AGENT }),
+    .default({
+      enabled: DEFAULT_MULTI_AGENT.enabled,
+      maxWorkers: DEFAULT_MULTI_AGENT.maxWorkers,
+      globalMaxWorkers: DEFAULT_MULTI_AGENT.globalMaxWorkers ?? 0,
+      allowUnattributedCalls: DEFAULT_MULTI_AGENT.allowUnattributedCalls,
+      strictChatAllowlist: DEFAULT_MULTI_AGENT.strictChatAllowlist ?? false,
+      recoverAgentTabs: DEFAULT_MULTI_AGENT.recoverAgentTabs,
+      waitForSubAgents: DEFAULT_MULTI_AGENT.waitForSubAgents ?? false,
+      endSleepingWorkerProcesses: DEFAULT_MULTI_AGENT.endSleepingWorkerProcesses ?? false
+    }),
   // An empty model id is repaired rather than rejected: the id is free text from a
   // provider listing that changes weekly, and a config that lost it must still load with
   // every root and permission in it intact.
@@ -439,7 +511,20 @@ const configSchema = z.object({
     })
     .optional()
     .default({ ...DEFAULT_MCP })
-    .catch({ ...DEFAULT_MCP })
+    .catch({ ...DEFAULT_MCP }),
+  // A malformed value falls back to off rather than to conservative recovery: the switches can
+  // only ever widen access, so "off" is the safe repair and the rest of the file stays valid.
+  // Each field repairs on its own, so a bad `allowActions` cannot switch the API itself off, and
+  // actions never outlive the API: a hand-edited `{ enabled: false, allowActions: true }` loads as off.
+  controlApi: z
+    .object({
+      enabled: z.boolean().optional().default(DEFAULT_CONTROL_API.enabled).catch(DEFAULT_CONTROL_API.enabled),
+      allowActions: z.boolean().optional().default(DEFAULT_CONTROL_API.allowActions).catch(DEFAULT_CONTROL_API.allowActions)
+    })
+    .transform((value) => ({ enabled: value.enabled, allowActions: value.enabled && value.allowActions }))
+    .optional()
+    .default({ ...DEFAULT_CONTROL_API })
+    .catch({ ...DEFAULT_CONTROL_API })
 });
 
 /**
@@ -460,13 +545,18 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform, rele
     roots: [],
     capabilities: firstLaunchCapabilities(platform, release),
     readOnly: false,
+    commandAllowlist: { ...DEFAULT_COMMAND_ALLOWLIST, rules: [] },
     tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
-    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, privacyScreenshots: false, theme: 'dark', autoRefreshPlugins: false, backgroundChats: true, autoContinue: true },
+    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, privacyScreenshots: false, theme: 'dark', autoRefreshPlugins: false, autoSelectSkills: false, backgroundChats: true, browserBridgePort: 'auto', autoContinue: true, followOutput: true, mentionCore: true,
+      // The built-in browser is opt-in: Chrome with the companion stays the default for new and
+      // existing installs alike, and the built-in one runs only once someone chooses it.
+      chatBrowser: 'chrome' },
     sessions: { ...DEFAULT_SESSIONS },
     compaction: { ...DEFAULT_COMPACTION },
     multiAgent: { ...FIRST_LAUNCH_MULTI_AGENT },
     goal: { ...DEFAULT_GOAL },
-    mcp: { ...DEFAULT_MCP }
+    mcp: { ...DEFAULT_MCP },
+    controlApi: { ...DEFAULT_CONTROL_API }
   };
 }
 
@@ -484,7 +574,8 @@ function conservativeRecoveryConfig(): Config {
     capabilities: { ...DEFAULT_CAPABILITIES },
     readOnly: true,
     multiAgent: { ...DEFAULT_MULTI_AGENT },
-    ui: { ...defaultConfig().ui, autoContinue: false },
+    // Damage is not a choice of browser either: keep the one every older config reads as.
+    ui: { ...defaultConfig().ui, autoContinue: false, chatBrowser: 'chrome' },
     // A config file that could not be trusted is not consent to have a second model typing
     // into the user's chat, whatever the unreadable file said.
     goal: { ...DEFAULT_GOAL }
@@ -640,8 +731,7 @@ export function effectiveCapabilities(
   return capped;
 }
 
-async function persistConfig(next: Config): Promise<Config> {
-  const parsed = configSchema.parse(next);
+async function persistConfig(parsed: Config): Promise<Config> {
   const tmp = `${configPath}.tmp`;
   await fs.mkdir(path.dirname(configPath), { recursive: true });
   await fs.writeFile(tmp, JSON.stringify(parsed, null, 2), 'utf8');
@@ -662,11 +752,15 @@ async function persistConfig(next: Config): Promise<Config> {
  */
 export function updateConfig(
   update: (latest: Config) => Config | Promise<Config>,
-  afterPublish?: (next: Config, previous: Config) => void | Promise<void>
+  afterPublish?: (next: Config, previous: Config) => void | Promise<void>,
+  publish?: (next: Config, previous: Config, persist: () => Promise<Config>) => Promise<Config>
 ): Promise<Config> {
   const operation = mutationQueue.then(async () => {
     const previous = current;
-    const next = await persistConfig(await update(previous));
+    // Validate before reserving external resources. The optional publisher owns their rollback.
+    const proposed = configSchema.parse(await update(previous));
+    const persist = () => persistConfig(proposed);
+    const next = await (publish ? publish(proposed, previous, persist) : persist());
     // Keep dependent durable retirement inside the same settings transaction;
     // the next On cannot overtake a published Off's cancellation work.
     await afterPublish?.(next, previous);

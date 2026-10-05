@@ -35,9 +35,12 @@ const mocks = vi.hoisted(() => {
     publication: vi.fn((surface: string, observe: (name: string, version: string, instructions: string, tools: unknown[]) => void) => observe(`Chat On Steroids ${surface}`, '1', 'instructions', [])),
     endpointStartGate: null as Promise<void> | null,
     endpointStartReached: vi.fn(),
+    endpointContexts: [] as Array<() => unknown>,
     tunnelStartGate: null as Promise<void> | null,
     tunnelStartReached: vi.fn(),
-    tunnelStop: vi.fn(async () => undefined),
+    optionalStartGate: null as Promise<void> | null,
+    optionalStartReached: vi.fn(),
+    tunnelStop: vi.fn(async (): Promise<void> => undefined),
     secretGate: null as Promise<void> | null,
     secretReached: vi.fn()
   };
@@ -55,7 +58,8 @@ vi.mock('../src/main/logger.js', () => ({ logError: vi.fn(), logInfo: vi.fn(), l
 vi.mock('../src/main/mcp/server.js', () => ({
   lastRequestAt: () => null,
   tunnelProbeHeaders: () => ({}),
-  startMcpServer: vi.fn(async () => {
+  startMcpServer: vi.fn(async (getContext: () => unknown) => {
+    mocks.endpointContexts.push(getContext);
     mocks.endpointStartReached();
     if (mocks.endpointStartGate) await mocks.endpointStartGate;
     return {
@@ -81,11 +85,15 @@ vi.mock('../src/main/secrets.js', () => ({
   })
 }));
 vi.mock('../src/main/tunnel/index.js', () => ({
-  startTunnel: vi.fn(async (options: { report: (report: Record<string, unknown>) => void }) => {
+  startTunnel: vi.fn(async (options: { label?: string; report: (report: Record<string, unknown>) => void }) => {
     mocks.starts += 1;
     mocks.report = options.report;
     mocks.tunnelStartReached();
     if (mocks.tunnelStartGate) await mocks.tunnelStartGate;
+    if (options.label === 'plugins') {
+      mocks.optionalStartReached();
+      if (mocks.optionalStartGate) await mocks.optionalStartGate;
+    }
     options.report({
       state: 'connected',
       detail: 'Connected.',
@@ -103,9 +111,12 @@ describe('connection surface state', () => {
     mocks.endpointStop.mockClear();
     mocks.publication.mockClear();
     mocks.endpointStartReached.mockClear();
+    mocks.endpointContexts.length = 0;
     mocks.endpointStartGate = null;
     mocks.tunnelStartReached.mockClear();
     mocks.tunnelStartGate = null;
+    mocks.optionalStartGate = null;
+    mocks.optionalStartReached.mockClear();
     mocks.tunnelStop.mockClear();
     mocks.secretReached.mockClear();
     mocks.secretGate = null;
@@ -150,6 +161,84 @@ describe('connection surface state', () => {
     } finally {
       await connection.disconnect();
       delete (mocks.config.tunnel as any).profileId; delete (mocks.config.tunnel as any).profileEpoch;
+    }
+  });
+
+  it('keeps each MCP endpoint generation pinned to the Setup profile that created it', async () => {
+    mocks.config.tunnel.kind = 'openai';
+    mocks.config.tunnel.tunnelId = 'same-core';
+    Object.assign(mocks.config.tunnel, { profileId: 'default', profileEpoch: 0 });
+    const connection = await import('../src/main/connection.js');
+    try {
+      await connection.connect();
+      const first = mocks.endpointContexts[0]!;
+      expect(first()).toMatchObject({ setupProfileId: 'default' });
+
+      // Config switches first; the old listener can still be draining accepted calls. Its
+      // provenance must remain Default until teardown completes instead of reading the new config.
+      Object.assign(mocks.config.tunnel, { profileId: 'second', profileEpoch: 1 });
+      expect(first()).toMatchObject({ setupProfileId: 'default' });
+      await connection.applySettings();
+
+      expect(mocks.endpointContexts).toHaveLength(2);
+      expect(first()).toMatchObject({ setupProfileId: 'default' });
+      expect(mocks.endpointContexts[1]!()).toMatchObject({ setupProfileId: 'second' });
+    } finally {
+      await connection.disconnect();
+      delete (mocks.config.tunnel as any).profileId;
+      delete (mocks.config.tunnel as any).profileEpoch;
+    }
+  });
+
+  /**
+   * Two connectors on one Secure Tunnel ID, said out loud.
+   *
+   * OpenAI's tunnel dispatches round-robin across every client registered on an ID, so two
+   * surfaces sharing one means every other call reaches the wrong connector — which answers
+   * `UNKNOWN_TOOL: This tool name is not in the current Plugins catalog` about a tool that exists
+   * and is published on the surface next door.
+   *
+   * Measured in #352: twenty consecutive Core `exec_command` calls with byte-identical payloads,
+   * ten succeeded and ten failed, alternating exactly, with the log alternating `POST mcp/core`
+   * and `POST mcp/plugins` in step. Nothing about the failure named its cause — restarting the app,
+   * refreshing the connectors and opening fresh chats all left it in place — so three people
+   * reached it the long way before anyone suspected the configuration.
+   *
+   * A warning and not a refusal: the IDs are the user's to choose. And no ID is ever logged.
+   */
+  it('warns when two connectors share one Secure Tunnel ID, and names both', async () => {
+    mocks.config.tunnel.kind = 'openai';
+    Object.assign(mocks.config.tunnel, { tunnelId: 'shared-id', pluginsTunnelId: 'shared-id', desktopTunnelId: '' });
+    const connection = await import('../src/main/connection.js');
+    const { logWarn } = await import('../src/main/logger.js');
+    try {
+      await connection.connect();
+      const said = (logWarn as unknown as { mock: { calls: string[][] } }).mock.calls
+        .map(call => String(call[0])).filter(line => line.includes('same Secure Tunnel ID'));
+      expect(said, 'a shared tunnel ID was not reported').toHaveLength(1);
+      expect(said[0]).toContain('core and plugins');
+      expect(said[0]).toContain('UNKNOWN_TOOL');
+      expect(said[0], 'the tunnel ID itself was logged').not.toContain('shared-id');
+    } finally {
+      await connection.disconnect();
+      Object.assign(mocks.config.tunnel, { tunnelId: '', pluginsTunnelId: '', desktopTunnelId: '' });
+    }
+  });
+
+  /** The control: distinct IDs are the ordinary case and must stay silent. */
+  it('says nothing when each connector has its own tunnel ID', async () => {
+    mocks.config.tunnel.kind = 'openai';
+    Object.assign(mocks.config.tunnel, { tunnelId: 'core-id', pluginsTunnelId: 'plugins-id', desktopTunnelId: 'desktop-id' });
+    const connection = await import('../src/main/connection.js');
+    const { logWarn } = await import('../src/main/logger.js');
+    try {
+      await connection.connect();
+      expect((logWarn as unknown as { mock: { calls: string[][] } }).mock.calls
+        .map(call => String(call[0])).filter(line => line.includes('same Secure Tunnel ID')),
+        'distinct IDs were reported as shared').toEqual([]);
+    } finally {
+      await connection.disconnect();
+      Object.assign(mocks.config.tunnel, { tunnelId: '', pluginsTunnelId: '', desktopTunnelId: '' });
     }
   });
 
@@ -287,6 +376,8 @@ describe('connection surface state', () => {
     const connecting = connection.connect();
     await vi.waitFor(() => expect(mocks.endpointStartReached).toHaveBeenCalledTimes(1));
     const shuttingDown = connection.shutdownConnection();
+    await shuttingDown;
+    expect(connection.getStatus().state).toBe('disconnected');
     releaseEndpoint();
     await Promise.all([connecting, shuttingDown]);
 
@@ -306,12 +397,124 @@ describe('connection surface state', () => {
     const connecting = connection.connect();
     await vi.waitFor(() => expect(mocks.tunnelStartReached).toHaveBeenCalledTimes(1));
     const shuttingDown = connection.shutdownConnection();
+    await shuttingDown;
+    expect(mocks.tunnelStop).not.toHaveBeenCalled();
     releaseTunnel();
     await Promise.all([connecting, shuttingDown]);
 
     expect(mocks.tunnelStop).toHaveBeenCalledTimes(1);
     expect(mocks.endpointStop).toHaveBeenCalledWith({ forceAfterMs: 30_000 });
     expect(connection.getStatus()).toMatchObject({ state: 'disconnected', publicUrl: null, localUrl: null });
+  });
+
+  it('finishes final shutdown without waiting for a parked credential lookup', async () => {
+    let releaseSecret!: () => void;
+    mocks.secretGate = new Promise<void>(resolve => { releaseSecret = resolve; });
+    const connection = await import('../src/main/connection.js');
+    const connecting = connection.connect();
+    await vi.waitFor(() => expect(mocks.secretReached).toHaveBeenCalledTimes(1));
+    const shutdown = connection.shutdownConnection();
+    let finished = false;
+    void shutdown.then(() => { finished = true; });
+    try {
+      expect(mocks.endpointStop).toHaveBeenCalledWith({ forceAfterMs: 30_000 });
+      await vi.waitFor(() => expect(finished).toBe(true));
+      expect(connection.getStatus().state).toBe('disconnected');
+      expect(mocks.starts).toBe(0);
+    } finally {
+      releaseSecret();
+      await Promise.all([connecting, shutdown]);
+    }
+    expect(mocks.starts).toBe(0);
+    expect(connection.getStatus().state).toBe('disconnected');
+  });
+
+  it('joins the entire existing teardown, including tunnel retirement after the response drain', async () => {
+    const connection = await import('../src/main/connection.js');
+    await connection.connect();
+    let releaseDrain!: () => void;
+    const drain = new Promise<void>(resolve => { releaseDrain = resolve; });
+    let releaseTunnel!: () => void;
+    const tunnelStop = new Promise<void>(resolve => { releaseTunnel = resolve; });
+    mocks.endpointStop.mockImplementationOnce(() => drain).mockImplementationOnce(() => drain);
+    mocks.tunnelStop.mockImplementationOnce(() => tunnelStop);
+    const disconnect = connection.disconnect();
+    await vi.waitFor(() => expect(mocks.endpointStop).toHaveBeenCalledTimes(1));
+    let finished = false;
+    const shutdown = connection.shutdownConnection().then(() => { finished = true; });
+    vi.useFakeTimers();
+    try {
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(finished).toBe(false);
+      expect(mocks.tunnelStop).not.toHaveBeenCalled();
+      releaseDrain();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mocks.tunnelStop).toHaveBeenCalledTimes(1);
+      expect(finished).toBe(false);
+      releaseTunnel();
+      await Promise.all([disconnect, shutdown]);
+      expect(connection.getStatus().state).toBe('disconnected');
+    } finally {
+      releaseDrain();
+      releaseTunnel();
+      await Promise.all([disconnect, shutdown]);
+      vi.useRealTimers();
+    }
+  });
+
+  it('retires a late optional tunnel after shutdown without publishing or leaking it', async () => {
+    mocks.config.tunnel.kind = 'openai';
+    mocks.config.tunnel.tunnelId = 'core-test';
+    mocks.config.tunnel.pluginsTunnelId = 'plugins-test';
+    let releaseOptional!: () => void;
+    mocks.optionalStartGate = new Promise<void>(resolve => { releaseOptional = resolve; });
+    const connection = await import('../src/main/connection.js');
+    const connecting = connection.connect();
+    await vi.waitFor(() => expect(mocks.optionalStartReached).toHaveBeenCalledTimes(1));
+    let finished = false;
+    const shutdown = connection.shutdownConnection().then(() => { finished = true; });
+    try {
+      await vi.waitFor(() => expect(finished).toBe(true));
+      expect(mocks.tunnelStop).toHaveBeenCalledTimes(1);
+      expect(connection.getStatus().state).toBe('disconnected');
+    } finally {
+      releaseOptional();
+      await Promise.all([connecting, shutdown]);
+    }
+    expect(mocks.tunnelStop).toHaveBeenCalledTimes(2);
+    expect(connection.getStatus().surfaces.every(surface => surface.state === 'off' && surface.publicUrl === null)).toBe(true);
+  });
+
+  it.each(['core', 'plugins'] as const)('keeps a late %s transport alive until accepted responses drain', async surface => {
+    mocks.config.tunnel.kind = 'openai';
+    mocks.config.tunnel.pluginsTunnelId = surface === 'plugins' ? 'plugins-test' : '';
+    let releaseStart!: () => void;
+    const startup = new Promise<void>(resolve => { releaseStart = resolve; });
+    if (surface === 'core') mocks.tunnelStartGate = startup;
+    else mocks.optionalStartGate = startup;
+    const connection = await import('../src/main/connection.js');
+    const connecting = connection.connect();
+    await vi.waitFor(() => expect(surface === 'core' ? mocks.tunnelStartReached : mocks.optionalStartReached).toHaveBeenCalled());
+    let releaseDrain!: () => void;
+    const drain = new Promise<void>(resolve => { releaseDrain = resolve; });
+    mocks.endpointStop.mockImplementationOnce(() => drain);
+    const shutdown = connection.shutdownConnection();
+    vi.useFakeTimers();
+    try {
+      releaseStart();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mocks.tunnelStop).not.toHaveBeenCalled();
+      expect(connection.getStatus().state).toBe('disconnecting');
+      releaseDrain();
+      await Promise.all([connecting, shutdown]);
+      expect(mocks.tunnelStop).toHaveBeenCalledTimes(surface === 'core' ? 1 : 2);
+      expect(connection.getStatus().state).toBe('disconnected');
+    } finally {
+      releaseStart();
+      releaseDrain();
+      await Promise.all([connecting, shutdown]);
+      vi.useRealTimers();
+    }
   });
 
   it('tears down the local endpoint when Keychain lookup resumes after final shutdown', async () => {

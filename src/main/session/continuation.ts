@@ -43,9 +43,9 @@
  * ended while the write was in flight — and a run that no longer exists has no prime left in
  * chat A to be inconsistent with.
  *
- * The state is flipped to `committing` *synchronously*, before the first await, so two
- * replacement chats racing to commit cannot both pass the check; the loser is refused and
- * the winner's failure restores the state for a retry. Nothing else may move the state
+ * The commit owner is reserved synchronously, before its durable state is published, so two
+ * replacement chats racing to commit cannot both pass the check. Checkpoint serialization
+ * also orders cancellation against that write. Nothing else may move the state
  * backwards out of `committing` — see {@link claimContinuationNow}, which is monotonic for
  * exactly that reason.
  */
@@ -66,9 +66,9 @@ import {
 import { clearChatWorkspace, moveChatWorkspace, workspaceForChat } from '../workspace.js';
 import { clearGoalObjective, clearGoalSwitch, goalObjectiveFor, goalSwitchFor, moveGoalObjective, moveGoalSwitch, retireGoalDraftsFor } from '../goal.js';
 import { writeDurableNow, writeDurableSoon } from '../durable.js';
-import { prepareHandoff, resumeBootstrapMatches } from './handoff.js';
+import { handoffMatchesContinuation, prepareHandoff, resumeBootstrapMatches } from './handoff.js';
 import { ensureHandoffRecorded, recordHandoff, recordNote, rebindConversation } from './recorder.js';
-import { endResumeClaim, noteResumeClaim, resetResumeGate } from './resume-gate.js';
+import { endResumeClaim, noteResumeClaim, noteResumeDispatch, resetResumeGate } from './resume-gate.js';
 import {
   ensureCommittedResumeHandoff,
   findSessionByConversation,
@@ -119,7 +119,7 @@ export type ContinuationState =
   | 'awaiting-chat'
   /** A replacement chat has claimed it and is being opened. */
   | 'claimed'
-  /** The rebind is in flight. Set synchronously so two commits cannot race. */
+  /** The durable commit intent has landed; the rebind is in flight. */
   | 'committing'
   | 'committed'
   | 'aborted';
@@ -224,7 +224,7 @@ interface Continuation {
   /**
    * The capture in flight, or the settled one. The single-flight lock for {@link attachSummary}.
    */
-  capture: Promise<Handoff> | null;
+  capture: Promise<Handoff | null> | null;
   /**
    * The stored handoff, kept so a repeated capture can be answered with the same success.
    *
@@ -501,7 +501,7 @@ function sweep(): void {
     // that is about to land — the write would still complete, on a transaction that had been
     // declared dead and had released the very handover it was carrying. The deadline applies
     // to *waiting*, and once the durable phase starts there is nothing left to wait for.
-    if (entry.state === 'committing') continue;
+    if (entry.state === 'committing' || commitLocks.has(entry.token) || checkpointLocks.has(entry.token)) continue;
     if (entry.state === 'committed' || entry.state === 'aborted') {
       // Kept briefly so a repeated ack can be answered with "already done" rather than with
       // a fresh transaction, then forgotten.
@@ -805,8 +805,9 @@ export async function openContinuationNow(
 
 async function withCheckpointLock<T>(token: string, work: () => Promise<T>): Promise<T> {
   const prior = checkpointLocks.get(token);
-  if (prior) await prior.catch(() => undefined);
-  const current = work();
+  // Reserve each waiter immediately; several callers must not all resume from the
+  // same predecessor and overwrite one another's staged durable transition.
+  const current = prior ? prior.then(work, work) : work();
   checkpointLocks.set(token, current);
   try {
     return await current;
@@ -958,6 +959,7 @@ export async function dispatchContinuationDestinationSendNow(token: string): Pro
       ...current,
       destinationSend: { state: 'dispatched-unresolved', conversationId: null, messageId: null }
     }));
+    noteResumeDispatch(entry.token);
     return true;
   });
 }
@@ -992,6 +994,7 @@ export async function releaseContinuationDestinationSendNow(token: string, unatt
       claimedBy: null,
       destinationSend: { state: 'not-attempted', conversationId: null, messageId: null }
     }));
+    endResumeClaim(entry.token);
     return true;
   });
 }
@@ -1017,7 +1020,11 @@ export async function bindContinuationDestinationMessageNow(
         entry.destinationSend.messageId === messageId
       );
     }
-    if (!isOpen(entry)) return false;
+    // B's first attributed tool call can commit the transaction before the page reports the
+    // message it typed. Recording that message for the committed destination moves nothing, and
+    // it is the resume boundary the page feed needs (where A's rows stop).
+    const committedHere = entry.state === 'committed' && entry.to === conversationId;
+    if (!isOpen(entry) && !committedHere) return false;
     if (entry.destinationSend.state !== 'dispatched-unresolved') return false;
     await transitionNow(entry, (current) => ({
       ...current,
@@ -1047,7 +1054,10 @@ export async function attachSummary(token: string, text: string): Promise<Handof
   return capture(token, brief, async (entry) =>
     prepareHandoff({
       sessionId: entry.sessionId,
-      text: brief
+      text: brief,
+      continuationToken: entry.token,
+      sourceConversationId: entry.from,
+      sourceTurnId: entry.sourceTurnId
     })
   );
 }
@@ -1097,19 +1107,24 @@ async function capture(
   if (entry.state !== 'awaiting-summary') return null;
   entry.capture = (async () => {
     const handoff = await produce(entry);
-    await transitionNow(entry, (current) => ({
-      ...current,
-      summary: handoff.text,
-      handoffId: handoff.id,
-      state: 'awaiting-chat',
-      error: null
-    }));
+    const accepted = await withCheckpointLock(token, async () => {
+      if (!isOpen(entry) || entry.state !== 'awaiting-summary') return false;
+      await transitionNow(entry, (current) => ({
+        ...current,
+        summary: handoff.text,
+        handoffId: handoff.id,
+        state: 'awaiting-chat',
+        error: null
+      }));
+      entry.handoff = handoff;
+      return true;
+    });
+    if (!accepted) return null;
     // The handoff file was written before the continuation WAL record, but it is deliberately
     // *not* in the session timeline yet. The WAL is the semantic commit for this capture: only
     // after it lands may `lastHandoffId` advertise the brief to unrelated recovery callers.
     // This closes the old inverse ordering where a rejected WAL transition had already made
     // its handoff discoverable and the retry produced a second handoff.
-    entry.handoff = handoff;
     try {
       await recordHandoff(entry.sessionId, handoff.id, handoff.text.length, 'compact and resume');
     } catch (err) {
@@ -1133,7 +1148,7 @@ async function capture(
  * again" — rather than a resolved null for one and a rejected promise for the others, which
  * would surface to a retrying page as a tool error for a step that merely has to be redone.
  */
-async function settle(entry: Continuation, capture: Promise<Handoff>): Promise<Handoff | null> {
+async function settle(entry: Continuation, capture: Promise<Handoff | null>): Promise<Handoff | null> {
   try {
     return await capture;
   } catch (err) {
@@ -1166,21 +1181,33 @@ async function settle(entry: Continuation, capture: Promise<Handoff>): Promise<H
  */
 export async function claimContinuationNow(token: string, claimant: string): Promise<{ summary: string } | null> {
   sweep();
-  const entry = byToken.get(token);
-  if (!entry || !isOpen(entry)) return null;
-  if (entry.state === 'awaiting-summary') return null;
-  if (entry.claimedBy !== null && entry.claimedBy !== claimant) return null;
-  if (entry.state === 'awaiting-chat') {
-    await transitionNow(entry, (current) => ({ ...current, claimedBy: claimant, state: 'claimed' }));
-  } else if (entry.state === 'claimed' && entry.claimedBy === null) {
-    await transitionNow(entry, (current) => ({ ...current, claimedBy: claimant }));
+  // A retry by the current claimant is read-only while its commit owns the write.
+  const committing = byToken.get(token);
+  if (committing && commitLocks.has(token) && isOpen(committing) && committing.claimedBy === claimant) {
+    return { summary: committing.summary };
   }
-  // After the transition, never before it. A throw here leaves nothing claimed, and arming
-  // first would have made every unrelated new chat wait out the window for a claim that
-  // does not exist.
-  if (entry.state === 'claimed') noteResumeClaim(entry.token);
-  // A same-owner redeem racing a commit is read-only. `committing` remains monotonic.
-  return { summary: entry.summary };
+  return withCheckpointLock(token, async () => {
+    const entry = byToken.get(token);
+    if (!entry || !isOpen(entry)) return null;
+    if (entry.state === 'awaiting-summary') return null;
+    if (entry.claimedBy !== null && entry.claimedBy !== claimant) return null;
+    if (entry.state === 'awaiting-chat') {
+      await transitionNow(entry, (current) => ({ ...current, claimedBy: claimant, state: 'claimed' }));
+    } else if (entry.state === 'claimed' && entry.claimedBy === null) {
+      await transitionNow(entry, (current) => ({ ...current, claimedBy: claimant }));
+    }
+    // After the transition, never before it. A throw here leaves nothing claimed, and arming
+    // first would have made every unrelated new chat wait out the window for a claim that
+    // does not exist.
+    if (entry.state === 'claimed') {
+      if (entry.destinationSend.state === 'dispatched-unresolved' || entry.destinationSend.state === 'sent') {
+        noteResumeDispatch(entry.token);
+      } else {
+        noteResumeClaim(entry.token);
+      }
+    }
+    return { summary: entry.summary };
+  });
 }
 
 function publishCommittedProjection(
@@ -1442,7 +1469,7 @@ export async function commitContinuationResult(
   // Ephemeral single-flight lock, separate from the durable record. Staged WAL persistence
   // deliberately does not publish `committing` before its write succeeds, so this lock is what
   // closes the tiny concurrent-ACK window without reintroducing mutation-before-await.
-  const work = commitContinuationUnlocked(entry, toConversationId);
+  const work = withCheckpointLock(token, () => commitContinuationUnlocked(entry, toConversationId));
   commitLocks.set(token, { to: toConversationId, promise: work });
   try {
     return await work;
@@ -1466,7 +1493,7 @@ export async function commitContinuation(token: string, toConversationId: string
  */
 export function abortContinuation(token: string, reason: string): boolean {
   const entry = byToken.get(token);
-  if (!entry || entry.state === 'committing') return false;
+  if (!entry || entry.state === 'committing' || commitLocks.has(token) || checkpointLocks.has(token)) return false;
   if (entry.state === 'committed' || entry.state === 'aborted') return false;
   entry.state = 'aborted';
   entry.error = reason;
@@ -1489,14 +1516,24 @@ function noteAbandoned(entry: Continuation, reason: string): void {
 
 /** Durable abort for user-visible cancellation paths. */
 export async function abortContinuationNow(token: string, reason: string): Promise<boolean> {
-  const entry = byToken.get(token);
-  if (!entry || entry.state === 'committing') return false;
-  if (entry.state === 'committed' || entry.state === 'aborted') return false;
-  await transitionNow(entry, (current) => ({ ...current, state: 'aborted', error: reason }));
-  cancelPrimeTransfer(entry.from);
-  logWarn(`continuation ${entry.token.slice(0, 8)} durably abandoned — ${reason}`);
-  noteAbandoned(entry, reason);
-  return true;
+  return withCheckpointLock(token, async () => {
+    const entry = byToken.get(token);
+    if (!entry || entry.state === 'committing') return false;
+    if (entry.state === 'committed' || entry.state === 'aborted') return false;
+    if (entry.automatic) {
+      const source = await getSession(entry.sessionId);
+      // The dispatched handoff may already be a new turn. Refuse that current
+      // source turn before retiring the ticket; later authored work can rearm it.
+      if (source?.conversationId === entry.from) {
+        await refuseAutomaticCompactionNow(entry.sessionId, entry.from, source.activeTurnId ?? entry.sourceTurnId);
+      }
+    }
+    await transitionNow(entry, (current) => ({ ...current, state: 'aborted', error: reason }));
+    cancelPrimeTransfer(entry.from);
+    logWarn(`continuation ${entry.token.slice(0, 8)} durably abandoned — ${reason}`);
+    noteAbandoned(entry, reason);
+    return true;
+  });
 }
 
 const SEND_STATES = new Set<ContinuationSendState>([
@@ -1602,9 +1639,17 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
       entry.askedAt = typeof raw.askedAt === 'number' && Number.isFinite(raw.askedAt) ? raw.askedAt : now;
     }
     const waitingExpired = entry.state !== 'committed' && entry.state !== 'aborted' && expired(entry, now);
+    let handoffProvenanceConflict = false;
     if (entry.handoffId) {
       try {
         entry.handoff = await readHandoff(entry.sessionId, entry.handoffId);
+        if (entry.handoff && !handoffMatchesContinuation(entry.handoff, entry.token, entry.from, entry.sourceTurnId)) {
+          handoffProvenanceConflict = true;
+          logWarn(
+            `continuation ${entry.token.slice(0, 8)} refused handoff ${entry.handoff.id}: stored provenance belongs to another transaction`
+          );
+          entry.handoff = null;
+        }
       } catch (err) {
         logWarn(`continuation ${entry.token.slice(0, 8)} handoff recovery failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -1635,7 +1680,7 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
         logWarn(`continuation ${entry.token.slice(0, 8)} session recovery failed: ${err instanceof Error ? err.message : String(err)}`);
       }
       if (session && entry.to && session.conversationId === entry.to) {
-        if (entry.handoffId) {
+        if (entry.handoffId && !handoffProvenanceConflict) {
           try {
             await ensureCommittedResumeHandoff(entry.sessionId, entry.to, entry.handoffId);
           } catch (err) {
@@ -1651,7 +1696,14 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
         entry.error = null;
         logInfo(`continuation ${entry.token.slice(0, 8)} recovered after durable commit`);
       } else if (entry.state === 'committing' && session && session.conversationId === entry.from) {
-        if (waitingExpired) {
+        if (!entry.handoff) {
+          entry.state = 'aborted';
+          entry.to = null;
+          entry.error = handoffProvenanceConflict
+            ? 'The saved handoff belongs to a different continuation.'
+            : 'The saved handoff could not be recovered.';
+          cancelPrimeTransfer(entry.from);
+        } else if (waitingExpired) {
           // The WAL proves the durable session move never landed. Restart must not turn an
           // already-expired ten-minute transaction into a fresh one merely because its
           // ephemeral transfer lock disappeared with the process.
@@ -1689,7 +1741,9 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
       // handoff data is not an empty valid brief and must not be typed into a new chat.
       } else if (entry.state !== 'awaiting-summary' && !entry.handoff) {
         entry.state = 'aborted';
-        entry.error = 'The saved handoff could not be recovered.';
+        entry.error = handoffProvenanceConflict
+          ? 'The saved handoff belongs to a different continuation.'
+          : 'The saved handoff could not be recovered.';
         cancelPrimeTransfer(entry.from);
       } else {
         beginPrimeTransfer(entry.from);
@@ -1701,7 +1755,13 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
     // collision it exists to prevent would be wide open for exactly the restart that is most
     // likely to hit it. Re-armed from now rather than from the original claim, because what
     // matters is how long from *here* that chat still has to appear.
-    if (entry.state === 'claimed') noteResumeClaim(entry.token);
+    if (entry.state === 'claimed') {
+      if (entry.destinationSend.state === 'dispatched-unresolved' || entry.destinationSend.state === 'sent') {
+        noteResumeDispatch(entry.token);
+      } else {
+        noteResumeClaim(entry.token);
+      }
+    }
     byToken.set(entry.token, entry);
   }
   try {

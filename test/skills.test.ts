@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,6 +11,8 @@ import {
   skillsDirectory
 } from '../src/main/skills.js';
 import { MAX_SKILL_BYTES, MAX_SKILLS } from '../src/shared/skills.js';
+import { defaultConfig, getConfig, initConfigPath, saveConfig } from '../src/main/config.js';
+import { rawPromises as rawFs } from '../src/main/rawfs.js';
 
 let userData = '';
 let sources = '';
@@ -19,6 +21,8 @@ beforeEach(async () => {
   userData = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'cos-skills-')));
   sources = path.join(userData, 'sources');
   await fs.mkdir(sources);
+  initConfigPath(userData);
+  await saveConfig(defaultConfig());
   await initSkillsPath(userData);
 });
 
@@ -95,6 +99,42 @@ describe('managed Skills store', () => {
     });
   });
 
+  it.each(['>-', '|', '>+', '|-'])('publishes bounded YAML %s descriptions instead of body fallback', async scalar => {
+    const text = [
+      '\uFEFF---',
+      'name: Code Review',
+      `description: ${scalar}`,
+      '  Review source code',
+      '  for correctness and maintainability.',
+      '...',
+      '# A different body title',
+      '',
+      'BODY_ONLY_MUST_NOT_REPLACE_METADATA'
+    ].join('\r\n');
+    const source = await sourceFile('code-review.md', text);
+    const summary = await importSkillFile(source);
+    expect(summary).toMatchObject({
+      id: 'code-review', name: 'Code Review',
+      description: 'Review source code for correctness and maintainability.'
+    });
+    expect(skillCatalogInstructions()).toContain(JSON.stringify(summary));
+    expect(skillCatalogInstructions()).not.toContain('BODY_ONLY_MUST_NOT_REPLACE_METADATA');
+    // Rebuilding the published catalog uses the same parsed metadata. The text decoder
+    // already strips a BOM; the stored source bytes still retain it and the original CRLF.
+    await initSkillsPath(userData);
+    expect(await listSkills()).toEqual([summary]);
+    expect((await readSkill(summary.id)).text).toBe(text.replace(/^\uFEFF/, ''));
+    expect(await fs.readFile(path.join(userData, 'skills', summary.id, 'SKILL.md'), 'utf8')).toBe(text);
+  });
+
+  it('keeps legacy fallback for invalid YAML rather than evaluating tags or adopting duplicate values', async () => {
+    const source = await sourceFile('invalid.md', [
+      '---', 'name: First', 'name: Second', 'description: !!js/function value', '---',
+      '# Legacy title', '', 'Safe fallback prose.'
+    ].join('\n'));
+    expect(await importSkillFile(source)).toMatchObject({ name: 'Legacy title', description: 'Safe fallback prose.' });
+  });
+
   it('derives a stable ID from a plain text filename and refuses duplicate publication', async () => {
     const one = await sourceFile('My useful skill.md', 'Plain instructions without a heading.\nContinue here.');
     const two = await sourceFile('my-useful-skill.md', '# Replacement\n\nMust not replace the first file.');
@@ -157,6 +197,95 @@ describe('managed Skills store', () => {
       path: '/skills/external/SKILL.md'
     }]);
     await expect(readSkill('nested')).rejects.toThrow(/not found/i);
+  });
+
+  it('discovers a linked package only while its target belongs to an approved root', async () => {
+    const approved = path.join(userData, 'approved');
+    const packageDirectory = path.join(approved, 'shared-review');
+    await fs.mkdir(path.join(packageDirectory, 'references'), { recursive: true });
+    await fs.writeFile(path.join(packageDirectory, 'SKILL.md'), '# Shared review\n\nRead the linked package.');
+    await fs.writeFile(path.join(packageDirectory, 'references', 'notes.md'), 'Package resource.');
+    await fs.symlink(packageDirectory, path.join(userData, 'skills', 'shared-review'), process.platform === 'win32' ? 'junction' : 'dir');
+
+    expect(await listSkills()).toEqual([]);
+    const previous = getConfig();
+    await saveConfig({ ...previous, roots: [{ name: 'approved', path: approved }] });
+    try {
+      expect(await listSkills()).toEqual([{
+        id: 'shared-review',
+        name: 'Shared review',
+        description: 'Read the linked package.',
+        path: '/skills/shared-review/SKILL.md'
+      }]);
+      expect((await readSkill('shared-review')).text).toContain('Read the linked package.');
+      const readDisabled = { ...getConfig(), capabilities: { ...getConfig().capabilities, read: false } };
+      await saveConfig(readDisabled);
+      expect(await listSkills()).toEqual([]);
+      await expect(readSkill('shared-review')).rejects.toThrow(/not found/i);
+      await saveConfig({ ...readDisabled, capabilities: { ...readDisabled.capabilities, read: true } });
+      expect(await listSkills()).toHaveLength(1);
+    } finally {
+      await saveConfig(previous);
+    }
+    expect(await listSkills()).toEqual([]);
+    await expect(readSkill('shared-review')).rejects.toThrow(/not found/i);
+  });
+
+  it('never opens an unapproved target when a linked package is retargeted mid-scan', async () => {
+    const approved = path.join(userData, 'approved-race');
+    const approvedPackage = path.join(approved, 'race-review');
+    const unapprovedPackage = path.join(userData, 'unapproved-race', 'race-review');
+    await fs.mkdir(approvedPackage, { recursive: true });
+    await fs.mkdir(unapprovedPackage, { recursive: true });
+    await fs.writeFile(path.join(approvedPackage, 'SKILL.md'), '# Approved race\n\nSAFE_TEXT');
+    await fs.writeFile(path.join(unapprovedPackage, 'SKILL.md'), '# Unapproved race\n\nSECRET_TEXT');
+    const link = path.join(userData, 'skills', 'race-review');
+    await fs.symlink(approvedPackage, link, process.platform === 'win32' ? 'junction' : 'dir');
+    const previous = getConfig();
+    await saveConfig({ ...previous, roots: [{ name: 'approved-race', path: approved }] });
+
+    const originalLstat = rawFs.lstat.bind(rawFs);
+    const originalOpen = rawFs.open.bind(rawFs);
+    const aliasFile = path.resolve(path.join(link, 'SKILL.md'));
+    const maliciousFile = path.resolve(path.join(unapprovedPackage, 'SKILL.md'));
+    const opened: string[] = [];
+    let retargeted = false;
+    const lstatSpy = vi.spyOn(rawFs, 'lstat').mockImplementation((async (target: Parameters<typeof rawFs.lstat>[0], ...args: unknown[]) => {
+      const candidate = path.resolve(String(target));
+      const same = process.platform === 'win32'
+        ? candidate.toLowerCase() === aliasFile.toLowerCase()
+        : candidate === aliasFile;
+      if (!retargeted && same) {
+        retargeted = true;
+        await fs.unlink(link);
+        await fs.symlink(unapprovedPackage, link, process.platform === 'win32' ? 'junction' : 'dir');
+      }
+      return (originalLstat as (...values: unknown[]) => ReturnType<typeof rawFs.lstat>)(target, ...args);
+    }) as typeof rawFs.lstat);
+    const openSpy = vi.spyOn(rawFs, 'open').mockImplementation((async (target: Parameters<typeof rawFs.open>[0], ...args: unknown[]) => {
+      opened.push(path.resolve(String(target)));
+      return (originalOpen as (...values: unknown[]) => ReturnType<typeof rawFs.open>)(target, ...args);
+    }) as typeof rawFs.open);
+    try {
+      const outcome = await listSkills().then(skills => ({ skills }), (error: unknown) => ({ error }));
+      // Never, on any platform: the unapproved target is not opened.
+      expect(opened.some(file => process.platform === 'win32'
+        ? file.toLowerCase() === maliciousFile.toLowerCase()
+        : file === maliciousFile)).toBe(false);
+      if (retargeted) {
+        // The scan followed the link and saw it retargeted: it must refuse, not read through.
+        expect('error' in outcome ? String(outcome.error) : '').toMatch(/managed Skills folder changed/i);
+      } else {
+        // The Windows arm64 release runner did not list the junction-linked package at all
+        // (2.1.25 publish, twice, same image and Node as the passing 2.1.24 run). Then the race
+        // cannot happen there; the package must simply be absent, never read through the link.
+        expect('skills' in outcome ? outcome.skills.map(skill => skill.name) : []).not.toContain('race-review');
+      }
+    } finally {
+      lstatSpy.mockRestore();
+      openSpy.mockRestore();
+      await saveConfig(previous);
+    }
   });
 
   it('fails closed instead of silently omitting a valid 65th skill', async () => {

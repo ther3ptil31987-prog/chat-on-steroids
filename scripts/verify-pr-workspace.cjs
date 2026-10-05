@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const root = path.resolve(__dirname, '..');
+const { fixtureConfigSource, BENIGN_RENDERER_ERRORS } = require('./fixtures/app-defaults.cjs');
 const output = path.join(root, 'outputs/pr-workspace');
 app.setPath('userData', path.join(output, 'runtime'));
 fs.mkdirSync(output, { recursive: true });
@@ -22,15 +23,17 @@ app.whenReady().then(async () => {
     const fixture = `
       localStorage.clear();
       window.fixtureErrors=[];
-      window.addEventListener('error', event => window.fixtureErrors.push(event.message));
+      window.addEventListener('error', event => { if (!${JSON.stringify(BENIGN_RENDERER_ERRORS)}.includes(event.message)) window.fixtureErrors.push(event.message); });
       window.addEventListener('unhandledrejection', event => window.fixtureErrors.push(String(event.reason)));
-      const config={roots:[{name:'demo',path:'C:/demo'}],readOnly:false,
+      ${fixtureConfigSource()}
+    const config = fixtureConfig({roots:[{name:'demo',path:'C:/demo'}],readOnly:false,
+        commandAllowlist:{enabled:false,mode:'allow',rules:[]},
         capabilities:{browse:true,search:true,read:true,metadata:true,create:true,edit:true,move:true,deleteFile:true,command:true,screen:false,control:false,clipboardRead:false,clipboardWrite:false},
         tunnel:{kind:'openai',tunnelId:'',desktopTunnelId:'',binaryPath:''},
         ui:{minimizeToTray:true,autoConnect:false,privacyScreenshots:false,theme:'dark'},
         sessions:{record:true,retainDays:30,advisoryTokens:300000,limitTokens:400000},compaction:{auto:true,autoTokens:300000},
         multiAgent:{enabled:false,maxWorkers:2,allowUnattributedCalls:false,recoverAgentTabs:false},
-        goal:{enabled:false,model:'fixture',reasoning:'default',prompt:'Fixture'}};
+        goal:{enabled:false,model:'fixture',reasoning:'default',prompt:'Fixture'}});
       const state={config,hasApiKey:false,hasGoalKey:false,resolvedBinary:null,bundledTunnelVersion:null,
         status:{state:'disconnected',detail:'',publicUrl:null,localUrl:null,handshakeAt:null,lastRequestAt:null,lastToolCallAt:null,health:null,surfaces:[]},
         bridge:{running:true,port:8765,paired:true,present:true,lastSeenAt:Date.now(),extensionVersion:'2.1.13'},
@@ -41,6 +44,14 @@ app.whenReady().then(async () => {
         lastToolCallAt:null,processExitNonzero:0,toolRejected:0,toolInternalErrors:0,errors:0,estimatedTokens:0,contextTokens:0,
         lastHandoffId:null,lastHandoffAt:null,lastTurnOutcome:'completed',activeTurnId:null,agents:[],origin:{kind:'desktop'}}));
       rows.push({...rows[0],id:'standalone',title:'Standalone chat',projectId:undefined});
+      const monitorNow=Date.now();
+      const monitorWorker={...rows[0],id:'worker-monitor',title:'worker-2 · Backend',conversationId:'chat-worker-monitor',
+        chatIds:['chat-worker-monitor'],startedAt:monitorNow-90_000,updatedAt:monitorNow,endedAt:null,events:1205,userMessages:2,toolCalls:1200,
+        lastToolCallAt:monitorNow-1000,lastToolActivity:{kind:'read',title:'Read src/main/agents.ts'},lastTurnOutcome:null,activeTurnId:'turn-monitor',
+        origin:{kind:'worker',fromSessionId:'task-0',agentId:'worker-2',task:'Inspect worker activity'}};
+      const monitorAgent={runId:'fixture-run',primeConversationId:'prime-fixture',id:'worker-2',role:'worker',label:'Backend',
+        task:'Inspect worker activity',reasoningEffort:null,model:null,state:'active',createdAt:monitorNow-90_000,activatedAt:monitorNow-89_000,
+        finishedAt:null,result:null,pending:0,awaitingAck:0,delivered:0,conversationId:'chat-worker-monitor',detachedAt:null,lastSeenAt:monitorNow,revivable:true};
       const files={'README.md':'# Demo workspace\\n\\nProject files, local drafts and bounded previews.\\n','example.ts':'export const value = 1;\\r\\n'};
       const ok=data=>Promise.resolve({ok:true,data});
       const info=(projectId,name)=>({projectId,projectName:projects.find(p=>p.id===projectId).name,path:name,name,
@@ -50,20 +61,26 @@ app.whenReady().then(async () => {
       window.fixtureSaves=[]; window.fixtureAttached=[];
       const personal={id:'review',name:'Code review',description:'Read the complete change, check behavior and preserve existing work.',path:'/skills/review/SKILL.md',managed:true,scope:'managed',source:'managed',allowImplicitInvocation:true};
       const projectSkill={id:'project-check--repo-fixture',name:'Project checks',description:'Use this project’s build, conventions and verification routes.',path:'/demo/.agents/skills/check/SKILL.md',managed:false,scope:'repo',source:'repo-agents',allowImplicitInvocation:true};
-      const diag={capturedAt:Date.now(),status:{connected:true,paired:true,compatible:true,extensionVersion:'2.1.13',extensionProtocol:14,appProtocol:14},
-        preferences:{overwrite:true,durations:false},tab:{tab:17,isChat:true,bound:true,recorder:true,conversationId:'fixture-chat',
-        page:{events:2,session:'fixture-session',requestId:'fixture-request',trace:[{requestId:'fixture-request',read:true,sent:true,confirmed:true,app:'request_id',tool:'read'}]}}};
       window.api=new Proxy({getState:()=>ok(state),getLog:()=>ok([]),getZoom:()=>ok(1),listProjects:()=>ok(projects),
-        listSessions:()=>ok({sessions:rows,total:3,nextCursor:null,activeId:null,pressure:[],blocked:[]}),
+        listSessions:()=>ok({sessions:rows,total:rows.length,nextCursor:null,activeId:null,pressure:[],blocked:[]}),
         getSession:id=>ok({events:[{seq:1,time:1,source:'extension',kind:'user_message',messageId:'question',message:{text:'Review this project',chars:19,truncated:false}},
           {seq:2,time:2,source:'extension',kind:'assistant_message',messageId:'answer',final:true,state:'final',message:{text:'The project workspace is ready for inspection.',chars:47,truncated:false}}],total:2,nextFrom:3}),
-        getSwarm:()=>ok({running:false,runId:null,agents:[],maxWorkers:2,pendingReports:0}),getChatModels:()=>ok({state:'unknown',models:[]}),
+        getSwarm:()=>ok({enabled:true,running:true,agents:[monitorAgent]}),getChatModels:()=>ok({state:'unknown',models:[]}),
         skillLibrary:()=>ok({skills:[personal,projectSkill],roots:[],errors:[],includeInstructions:true}),
         listSkills:()=>ok([personal]),listInputs:()=>ok([]),getSessionPlan:()=>ok(null),browserPreferences:()=>ok({overwrite:true,durations:false}),
-        companionDiagnostics:()=>ok(diag),internalBrowser:undefined,
         listProjectFiles:(id,directory='')=>ok({projectId:id,projectName:'Demo workspace',directory,truncated:false,
           entries:['README.md','example.ts','preview.pdf'].map(name=>({name,path:name,kind:'file',bytes:files[name]?.length??${pdf.length}}))}),
         watchProjectFiles:()=>ok(true),previewProjectFile:(id,name)=>ok(info(id,name)),
+        getProjectGitSnapshot:(id,baseRef)=>ok({projectId:id,state:'ready',truncated:false,revision:baseRef?'fixture-compared':'fixture-dirty',
+          currentBranch:'feature',branches:[{ref:'refs/remotes/origin/main',label:'origin/main'},{ref:'refs/heads/feature',label:'feature'}],
+          ...(baseRef?{comparison:{ref:baseRef,label:'origin/main',baseOid:'a'.repeat(40),headOid:'b'.repeat(40)}}:{}),changes:baseRef?[
+          {status:'M',path:'README.md',additions:2,deletions:1,binary:false}
+        ]:[
+          {status:'M',path:'README.md',additions:2,deletions:1,binary:false},
+          {status:'U',path:'notes.txt',additions:3,deletions:0,binary:false}
+        ]}),
+        getProjectGitDiff:(id,name)=>ok({projectId:id,status:'M',path:name,additions:2,deletions:1,binary:false,tooLarge:false,
+          baseText:'# Demo workspace\\n',currentText:'# Demo workspace\\n\\nUpdated in the working tree.\\n'}),
         attachProjectFile:(id,name)=>{window.fixtureAttached.push({id,name});return ok({id:'file-1',name,size:12,mimeType:'text/plain'});},
         saveProjectFile:(id,name,text)=>{files[name]=text;window.fixtureSaves.push({id,name,text});return ok({preview:info(id,name)});},
         writeClipboard:()=>ok(true),connect:()=>{state.status.state='connected';return ok(state)},disconnect:()=>{state.status.state='disconnected';return ok(state)}
@@ -71,7 +88,9 @@ app.whenReady().then(async () => {
       await import('/main.ts');
       const {setLanguage,t}=await import('/i18n.ts');
       const {EditorView}=await import('@codemirror/view');
-      window.fixture={setLanguage,t,readyConnection(){state.hasApiKey=true;config.tunnel.tunnelId='tunnel_'+'1'.repeat(32);},edit(text){const view=EditorView.findFromDOM(document.querySelector('.file-preview .cm-editor'));
+      window.fixture={setLanguage,t,readyConnection(){state.hasApiKey=true;config.tunnel.tunnelId='tunnel_'+'1'.repeat(32);},
+        addMonitorWorker(){if(!rows.some(row=>row.id===monitorWorker.id))rows.push(monitorWorker);},
+        edit(text){const view=EditorView.findFromDOM(document.querySelector('.file-preview .cm-editor'));
         if(!view)throw new Error('Editor not ready');view.dispatch({changes:{from:0,to:view.state.doc.length,insert:text}});}};
       window.fixtureReady=true;
     `;
@@ -106,12 +125,62 @@ app.whenReady().then(async () => {
     };
     await win.loadURL(server.resolvedUrls.local[0] + 'fixture.html');
     await until('window.fixtureReady && document.querySelectorAll(".sess[data-id]").length===3');
+    assert.ok(await js(`(()=>{const button=document.getElementById('chatRefresh');const heading=button.closest('.sidebar-session-heading');const a=button.getBoundingClientRect(),b=heading.getBoundingClientRect();return button.children.length===1&&Math.abs((a.top+a.bottom-b.top-b.bottom)/2)<1})()`));
     assert.equal(await js('document.querySelectorAll("#projectList .sess[data-id]").length'),2);
     assert.equal(await js('document.querySelectorAll("#chatList .sess[data-id]").length'),1);
     await js(`document.querySelector('.sess[data-id="task-0"]').click()`);
-    await until('!document.getElementById("filePanelToggle").hidden');
-    await js(`document.getElementById('filePanelToggle').click()`);
+    await until('!document.querySelector("#workDockRight .work-dock-quick[data-view=files]").disabled');
+    await js(`document.getElementById('rightDockToggle').click()`);
+    assert.ok(await js(`['review','terminal','files','agents'].every(kind=>!document.querySelector('#workDockRight .work-dock-quick[data-view='+kind+']').disabled)`));
+    await screenshot('dock-shortcuts');
+    await js(`document.querySelector('#workDockRight .work-dock-quick[data-view=review]').click()`);
+    await until('!!document.querySelector("#workDockRight .review-panel:not([hidden])")');
+    await js(`window.fixture.addMonitorWorker();document.getElementById('chatRefresh').click()`);
+    await js(`new Promise(resolve=>setTimeout(resolve,300))`);
+    await js(`document.querySelector('#workDockRight .work-dock-tab.is-selected .btn-icon').click();document.querySelector('#workDockRight .work-dock-quick[data-view=agents]').click()`);
+    await until('!!document.querySelector("#workDockRight .agent-panel:not([hidden]) .agent-panel-row")');
+    assert.equal(await js(`document.querySelector('.agent-panel-row .agent-card-activity')?.textContent`),'Read src/main/agents.ts');
+    assert.match(await js(`document.querySelector('.agent-panel-row .agent-card-meta')?.textContent||''`),/1\.2k actions/);
+    await screenshot('agent-monitor-activity');
+    await js(`document.querySelector('#workDockRight .work-dock-tab.is-selected .btn-icon').click();document.querySelector('#workDockRight .work-dock-quick[data-view=files]').click()`);
     await until('document.querySelectorAll(".file-tree-row[data-path]").length>=3');
+    await until('document.querySelector(".file-panel-changes-badge")?.textContent==="2"');
+    await js(`document.querySelector('.file-panel-changes-toggle').click()`);
+    await until('!document.querySelector("#workDockRight .review-panel .file-changes-view").hidden && document.querySelectorAll("#workDockRight .review-panel .file-change-row").length===2');
+    await screenshot('git-changes');
+    assert.equal(await js('document.querySelector(".review-panel .file-changes-header-title").textContent'),'feature');
+    await js(`document.querySelector('.review-panel .file-branch-trigger').click()`);
+    await until('!!document.querySelector(".file-branch-menu .file-branch-search")');
+    await js(`{const input=document.querySelector('.file-branch-search');input.value='origin';input.dispatchEvent(new Event('input',{bubbles:true}));}`);
+    assert.equal(await js(`document.querySelectorAll('.file-branch-option').length`),1);
+    await screenshot('review-branch-search');
+    await js(`document.querySelector('.file-branch-option').click()`);
+    await until(`document.querySelector('.review-panel .file-branch-trigger')?.textContent.includes('origin/main') && document.querySelectorAll('.review-panel .file-change-row').length===1`);
+    await screenshot('review-branch-compare');
+    await js(`document.querySelector('.review-panel .file-branch-trigger').click();document.querySelector('.file-branch-option').click()`);
+    await until(`document.querySelectorAll('.review-panel .file-change-row').length===2`);
+    assert.equal(await js('document.querySelector(".review-panel .file-change-row[data-path=\\"README.md\\"] .file-change-status").textContent'),'M');
+    assert.ok(await js(`!document.querySelector('.review-panel .file-panel-toolbar') && !!document.querySelector('.review-panel .file-changes-header .file-panel-refresh')`));
+    assert.deepEqual(await js(`[...document.querySelectorAll('.header-dock-controls > button')].map(button=>button.id)`),
+      ['rightDockExpand','terminalToggle','rightDockToggle']);
+    assert.equal(await js(`document.querySelector('#workDockRight .work-dock-bar > .btn-icon')`),null);
+    assert.ok(await js(`(()=>{const tab=document.querySelector('#workDockRight .work-dock-tab:last-child').getBoundingClientRect();const plus=document.querySelector('#workDockRight .work-dock-add summary').getBoundingClientRect();return plus.left-tab.right<=12&&plus.left>=tab.right})()`));
+    assert.equal(await js(`document.getElementById('rightDockExpand').hidden`),false);
+    await js(`document.getElementById('rightDockExpand').click()`);
+    assert.ok(await js(`document.querySelector('[data-panel=chat]').classList.contains('is-work-dock-expanded') && document.getElementById('workDockBottom').hidden`));
+    await screenshot('review-expanded');
+    await js(`document.getElementById('rightDockExpand').click();document.querySelector('#workDockRight .work-dock-tab [role=tab][aria-selected=false]').click()`);
+    await js(`document.querySelector('#workDockRight .work-dock-add summary').click();document.querySelector('#workDockRight .work-dock-menu-item[data-view=review]').click()`);
+    await until('!!document.querySelector("#workDockRight .review-panel:not([hidden])")');
+    await js(`document.querySelector('.review-panel .file-change-row[data-path="README.md"]').click()`);
+    await until('!!document.querySelector(".review-panel .file-diff-viewer-host .cm-editor")');
+    await screenshot('git-diff');
+    assert.equal(await js('document.querySelector(".review-panel .file-changes-header-title").textContent'),'Diff');
+    assert.ok(await js('document.querySelector(".review-panel .file-preview-meta").textContent.includes("README.md")'));
+    await js(`document.querySelector('.review-panel .file-changes-back').click()`);
+    await until('document.querySelector(".review-panel .file-changes-header-title").textContent==="feature"');
+    await js(`document.querySelector('#workDockRight .work-dock-tab [role=tab][aria-selected=false]').click()`);
+    await until('!document.querySelector(".file-tree").hidden');
     await js(`document.querySelector('.file-tree-row[data-path="README.md"]').click()`);
     await until('!!document.querySelector(".file-preview-markdown h1")');
     for (const [width, height, zoom, language] of [[1500,1000,1.17,'en'],[1100,850,1,'es'],[820,740,1.17,'es'],[1100,850,1.17,'zh-TW']]) {
@@ -121,6 +190,22 @@ app.whenReady().then(async () => {
         fits:r.left>=0&&r.right<=innerWidth+1&&r.bottom<=innerHeight+1,width:r.width,height:r.height,
         title:document.querySelector('.file-panel').getAttribute('aria-label'),overflow:document.documentElement.scrollWidth>innerWidth};})()`);
       assert.ok(measured.fits && !measured.overflow && measured.width>200,JSON.stringify({width,zoom,measured}));
+      if (width === 820) assert.ok(await js(`(()=>{
+        const bar=document.querySelector('.file-panel:not([hidden]) .file-panel-toolbar');
+        const actions=bar.querySelector('.file-panel-toolbar-actions');
+        const refresh=bar.querySelector('.file-panel-refresh');
+        const tabs=document.querySelector('#workDockRight .work-dock-tabs');
+        const before=refresh.getBoundingClientRect().right;
+        actions.scrollLeft=actions.scrollWidth;
+        const scrolls=actions.scrollWidth>actions.clientWidth&&actions.scrollLeft>0;
+        const fixed=Math.abs(refresh.getBoundingClientRect().right-before)<1
+          &&Math.abs(refresh.getBoundingClientRect().right-(bar.getBoundingClientRect().right-10))<2;
+        actions.scrollLeft=0;
+        return scrolls&&fixed&&getComputedStyle(actions).flexWrap==='nowrap'
+          &&getComputedStyle(actions).scrollbarWidth==='none'
+          &&getComputedStyle(tabs).overflowX==='auto'
+          &&getComputedStyle(tabs).scrollbarWidth==='none';
+      })()`));
       results.push({width,height,zoom,language,...measured});
       await screenshot(`files-${language}-${width}`);
     }
@@ -128,7 +213,7 @@ app.whenReady().then(async () => {
     await js(`window.fixture.setLanguage('en');document.querySelector('.file-tree-row[data-path="example.ts"]').click()`);
     await until('!!document.querySelector(".file-preview .cm-editor")');
     await js(`document.querySelector('.file-preview [title="Edit"]').click()`);
-    await until('!!document.querySelector(".file-editor-save")');
+    await until('!!document.querySelector(".file-editor-save") && !!document.querySelector(".file-preview.is-editing .cm-editor")');
     await js(`window.fixture.edit('export const value = 2;')`);
     await js(`document.querySelector('.sess[data-id="task-1"]').click();document.querySelector('.sess[data-id="task-0"]').click()`);
     await until('!!document.querySelector(".file-editor-save") && document.querySelector(".file-preview .cm-content")?.textContent.includes("value = 2")');
@@ -141,15 +226,16 @@ app.whenReady().then(async () => {
     await until('!!document.querySelector(".file-pdf-canvas:not([hidden])")');
     assert.ok(await js(`(()=>{const c=document.querySelector('.file-pdf-canvas');return c.width*c.height>100&&c.width*c.height<=16*1024*1024;})()`));
     await screenshot('pdf-rendered');
-    await js(`document.getElementById('sidebarConnection').click();document.getElementById('connectionAdvanced').open=true`);
-    await until('document.getElementById("connectionPipelineWhy").textContent.includes("matched to recorded tool activity")');
+    await js(`document.getElementById('sidebarConnection').click()`);
+    assert.equal(await js('document.getElementById("connectionPopoverTitle").textContent'), 'Not connected');
+    assert.equal(await js('document.querySelector("#connectionPopover details")'), null);
     const bounds=await js(`(()=>{const r=document.getElementById('connectionPopover').getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,fits:r.x>=0&&r.y>=0&&r.right<=innerWidth&&r.bottom<=innerHeight};})()`);
     assert.equal(bounds.fits,true,JSON.stringify(bounds));
-    await screenshot('connection-diagnostics');
+    await screenshot('connection-status');
     await js(`document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))`);
     assert.equal(await js('document.getElementById("connectionPopover").hidden'),true);
     assert.equal(await js('document.activeElement.id'),'sidebarConnection');
-    await js(`document.getElementById('filePanelToggle').click();document.getElementById('sidebarPlugins').click()`);
+    await js(`document.getElementById('rightDockToggle').click();document.getElementById('sidebarPlugins').click()`);
     assert.equal(await js('document.querySelector(".app").dataset.screen'),'library');
     assert.equal(await js('document.getElementById("sidebarPrimary").hidden'),false);
     await js(`document.querySelector('[data-new-project="project-b"]').click()`);
@@ -192,11 +278,12 @@ app.whenReady().then(async () => {
     await screenshot('traditional-chinese-settings');
     // Every opening is compact, including when translucency creates a sidebar stacking context.
     await js(`document.documentElement.dataset.translucentSidebar='true';document.getElementById('sidebarConnection').click()`);
-    assert.equal(await js('document.getElementById("connectionAdvanced").open'),false);
+    assert.equal(await js('document.getElementById("connectionAdvanced")'),null);
     assert.equal(await js('document.getElementById("connectionPopoverSettings")'),null);
     assert.equal(await js('document.getElementById("connectionAdvancedOverwrite")'),null);
-    await js(`document.getElementById('connectionAdvanced').open=true;document.getElementById('connectionRuntime').open=true;document.getElementById('sidebarConnection').click();document.getElementById('sidebarConnection').click()`);
-    assert.equal(await js('document.getElementById("connectionAdvanced").open || document.getElementById("connectionRuntime").open'),false);
+    await js(`document.getElementById('sidebarConnection').click();document.getElementById('sidebarConnection').click()`);
+    assert.equal(await js('document.querySelector("#connectionPopover details")'),null);
+    assert.equal(await js('document.getElementById("connectionPopover").hidden'),false);
     await screenshot('connection-compact');
     await js(`document.getElementById('sidebarConnection').click();document.getElementById('viewMenu').open=true`);
     assert.ok(await js(`(()=>{const n=document.getElementById('zoomIn'),r=n.getBoundingClientRect();return n.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2))})()`));
@@ -206,11 +293,18 @@ app.whenReady().then(async () => {
     assert.ok(Math.max(...heights)-Math.min(...heights)<2,JSON.stringify(heights));
     await screenshot('appearance-aligned');
     await js(`document.querySelector('[data-tab=setup]').click();window.fixture.setLanguage('es')`);
-    const setup=await js(`(()=>{const h=document.querySelector('.setup-heading');return {display:getComputedStyle(h).display,columns:getComputedStyle(h).gridTemplateColumns}})()`);
-    assert.equal(setup.display,'grid'); await screenshot('setup-spanish-aligned');
+    // Title and language flags share a row only while both fit; the flags never cover the title.
+    const setup=await js(`(()=>{const h=document.querySelector('.setup-heading'),t=h.querySelector('h1').getBoundingClientRect(),f=h.querySelector('.language-tabs').getBoundingClientRect();return {overlap:!(f.left>=t.right||f.top>=t.bottom),titleClipped:h.querySelector('h1').scrollWidth>h.querySelector('h1').clientWidth+1,flagsInside:f.right<=h.getBoundingClientRect().right+1}})()`);
+    assert.deepEqual(setup,{overlap:false,titleClipped:false,flagsInside:true}); await screenshot('setup-spanish-aligned');
+    // A laptop-sized window: the twelve flags no longer fit beside the title and must move below it.
+    win.setSize(1100,800); await new Promise(resolve=>setTimeout(resolve,300));
+    const narrowSetup=await js(`(()=>{const h=document.querySelector('.setup-heading'),t=h.querySelector('h1').getBoundingClientRect(),f=h.querySelector('.language-tabs').getBoundingClientRect();return {overlap:!(f.left>=t.right||f.top>=t.bottom),titleClipped:h.querySelector('h1').scrollWidth>h.querySelector('h1').clientWidth+1,flagsInside:f.right<=h.getBoundingClientRect().right+1}})()`);
+    assert.deepEqual(narrowSetup,{overlap:false,titleClipped:false,flagsInside:true}); await screenshot('setup-spanish-laptop');
+    win.setSize(1500,1000); await new Promise(resolve=>setTimeout(resolve,300));
     await js(`document.getElementById('backToChat').click();const input=document.getElementById('chatInput');input.value='/';input.setSelectionRange(1,1);input.dispatchEvent(new Event('input',{bubbles:true}));`);
     await until('!document.getElementById("skillPicker").hidden && document.querySelector(".skill-choice")');
-    assert.equal(await js('document.getElementById("sidebarSkills")'),null);
+    // The Skills library has its own sidebar entry since 2026-09-27; slash commands still work beside it.
+    assert.ok(await js('!!document.getElementById("sidebarSkills")'));
     assert.equal(await js('document.querySelector(".skill-add")'),null);
     await screenshot('slash-commands-skills');
     await js(`document.getElementById('composerAddSkill').closest('details').open=true`);
@@ -221,9 +315,8 @@ app.whenReady().then(async () => {
     await until('document.getElementById("headerConnect").hidden && document.getElementById("sidebarConnection").classList.contains("is-connected")');
     const errors=await js('window.fixtureErrors');
     assert.deepEqual(errors,[]);
-    fs.writeFileSync(path.join(output,'results.json'),JSON.stringify({renderer:'current source in Chromium; synthetic backend',results,save:true,draftRoundTrip:true,pdf:true,diagnostics:bounds,skillsDraftRoundTrip:true,sharedLibrary:true,sidebar:true,composer,errors},null,2));
-    console.log('PASS: current renderer Files layouts, real editor draft navigation, PDF rendering, diagnostics, Skills chips/shared library, Projects/Chats, Spanish and Traditional Chinese. '+output);
+    fs.writeFileSync(path.join(output,'results.json'),JSON.stringify({renderer:'current source in Chromium; synthetic backend',results,save:true,draftRoundTrip:true,gitChanges:true,pdf:true,connection:bounds,skillsDraftRoundTrip:true,sharedLibrary:true,sidebar:true,composer,agentMonitor:{latestActivity:true,actionCount:true},errors},null,2));
+    console.log('PASS: current renderer Files layouts, Agent Monitor activity/count, read-only Git Changes/diff, real editor draft navigation, PDF rendering, connection status, Skills chips/shared library, Projects/Chats, Spanish and Traditional Chinese. '+output);
   } finally { win?.destroy(); await server?.close(); }
   app.exit(0);
 }).catch(error=>{console.error(error);app.exit(1)});
-

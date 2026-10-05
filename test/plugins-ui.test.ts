@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 import { readFileSync } from 'node:fs';
 import { initPlugins, refreshPlugins, applyPluginsState } from '../src/renderer/plugins.js';
+import { setLanguage } from '../src/renderer/i18n.js';
 import type { PluginSnapshot } from '../src/shared/plugins.js';
 import type { AppState } from '../src/shared/types.js';
 
@@ -75,11 +76,16 @@ it('keeps first-use setup and the connector-refresh instruction visible, includi
   initPlugins(); await tick();
   expect(document.querySelector('.plugin-connection')!.textContent).toContain('before your first use');
   expect(document.querySelector('.plugin-refresh-guide')!.textContent).toContain('After installing, updating or changing enabled plugins');
-  applyPluginsState({ config: { tunnel: { kind: 'manual' } }, status: { surfaces: [{ id: 'plugins', state: 'live', lastRequestAt: 1 }] } } as unknown as AppState);
+  applyPluginsState({ config: { tunnel: { kind: 'manual' } }, status: { surfaces: [{ id: 'plugins', state: 'live', lastRequestAt: 1, tools: [] }] } } as unknown as AppState);
   expect(document.getElementById('pluginsSetupTitle')!.textContent).toBe('Your Plugins connector');
   expect(document.querySelector('.plugin-refresh-guide')!.textContent).toContain('refresh Chat On Steroids Plugins in ChatGPT');
   document.getElementById('pluginsOpenChatGPT')!.click(); await tick();
-  expect(api.openLink).toHaveBeenCalledWith('https://chatgpt.com/#settings/Plugins');
+  expect(api.openLink).toHaveBeenCalledExactlyOnceWith('https://chatgpt.com/plugins');
+  document.getElementById('pluginsSetupLink')!.click();
+  [...document.querySelectorAll<HTMLButtonElement>('#pluginDialog button')]
+    .find(node => node.textContent === 'Open ChatGPT plugins')!.click();
+  await tick();
+  expect(api.openLink!.mock.calls).toEqual([['https://chatgpt.com/plugins'], ['https://chatgpt.com/plugins']]);
 });
 
 it('keeps plugin connection setup local, preserves a draft and saves through the existing settings authority', async () => {
@@ -146,6 +152,26 @@ it('opens a concise tool preview without installing or showing enabled-tool cont
   expect(api.pluginsInstall).not.toHaveBeenCalled();
 });
 
+it('marks the About and Setup disclosures with the chevron, and keeps it through a language change', async () => {
+  // The native marker is hidden, so the chevron is the only sign these rows open.
+  const chevronFirst = (summary: HTMLElement) => summary.firstElementChild!.classList.contains('details-chevron');
+  await refreshPlugins();
+  document.querySelector<HTMLButtonElement>('#pluginsExplore .plugin-catalog-card')!.click();
+  const setup = document.querySelector<HTMLElement>('#pluginDialog .plugin-about > summary')!;
+  expect(setup.textContent).toBe('Setup requirements');
+  expect(chevronFirst(setup)).toBe(true);
+  document.querySelector<HTMLButtonElement>('.plugin-entry')!.click();
+  const about = [...document.querySelectorAll<HTMLElement>('#pluginDialog .plugin-about > summary')].find(node => node.textContent === 'About this plugin')!;
+  expect(chevronFirst(about)).toBe(true);
+  try {
+    setLanguage('pt-BR');
+    expect(about.textContent).toBe('Sobre este plugin');
+    expect(chevronFirst(about)).toBe(true);
+  } finally {
+    setLanguage('en');
+  }
+});
+
 it('opens the full error from the compact card and exposes configuration beside the introduction', async () => {
   const error = 'Connection refused. Start the application and enable its companion integration.';
   state.plugins[0]!.error = error;
@@ -175,4 +201,64 @@ it('waits for explicit sign-in and updates the same detail with a cancellable au
   expect(api.pluginsCancelAuthentication).toHaveBeenCalledWith('one');
   state.plugins[0]!.status = 'ready'; await refreshPlugins();
   expect(document.querySelector('.plugin-auth')).toBeNull();
+});
+
+it('offers OAuth for a custom remote server and opens the new plugin where it can sign in', async () => {
+  initPlugins(); await tick();
+  document.getElementById('pluginsAdd')!.click();
+  [...document.querySelectorAll<HTMLButtonElement>('.plugin-actions button')].find(node => node.textContent === 'Remote MCP URL')!.click();
+  const fields = () => [...document.querySelectorAll<HTMLLabelElement>('.plugin-field')];
+  const labelled = (text: string) => fields().find(node => node.querySelector('span')!.textContent === text)!;
+  const [type, auth] = [labelled('Server type'), labelled('Authentication')].map(node => node.querySelector('select')!);
+  expect(labelled('Authentication').hidden).toBe(false);
+  type!.value = 'npm'; type!.dispatchEvent(new dom.window.Event('change'));
+  expect(labelled('Authentication').hidden, 'OAuth is a remote-only choice').toBe(true);
+  type!.value = 'remote'; type!.dispatchEvent(new dom.window.Event('change'));
+  auth!.value = 'oauth'; auth!.dispatchEvent(new dom.window.Event('change'));
+  expect(labelled('Credential value').hidden, 'no static credential beside a provider sign-in').toBe(true);
+  labelled('Credential value').querySelector('input')!.value = 'left over';
+  labelled('Credential name (optional)').querySelector('input')!.value = 'Authorization';
+  labelled('Package, executable, URL or bundle path').querySelector('input')!.value = 'https://mcp.example.org/mcp';
+  const added = { ...state.plugins[0]!, id: 'two', name: 'Remote', source: { kind: 'remote' as const, url: 'https://mcp.example.org/mcp', auth: 'oauth' as const }, status: 'needs-auth' as const, credentialKeys: [] };
+  api.pluginsInstall!.mockImplementation(async () => ({ ok: true, data: { ...state, plugins: [...state.plugins, added] } }));
+  [...document.querySelectorAll<HTMLButtonElement>('button')].find(node => node.textContent === 'Install and connect')!.click();
+  await tick(); await tick();
+  expect(api.pluginsInstall).toHaveBeenCalledWith({ name: 'My MCP server', source: { kind: 'remote', args: [], url: 'https://mcp.example.org/mcp', auth: 'oauth' }, credentials: {} });
+  expect(document.querySelector('.plugin-auth button'), 'lands on the new plugin with its Sign in').not.toBeNull();
+});
+
+it('keeps a custom remote server without OAuth on its static credential', async () => {
+  initPlugins(); await tick();
+  document.getElementById('pluginsAdd')!.click();
+  [...document.querySelectorAll<HTMLButtonElement>('.plugin-actions button')].find(node => node.textContent === 'Remote MCP URL')!.click();
+  const labelled = (text: string) => [...document.querySelectorAll<HTMLLabelElement>('.plugin-field')].find(node => node.querySelector('span')!.textContent === text)!;
+  labelled('Package, executable, URL or bundle path').querySelector('input')!.value = 'https://mcp.example.org/mcp';
+  labelled('Credential name (optional)').querySelector('input')!.value = 'Authorization';
+  labelled('Credential value').querySelector('input')!.value = 'Bearer x';
+  [...document.querySelectorAll<HTMLButtonElement>('button')].find(node => node.textContent === 'Install and connect')!.click();
+  await tick();
+  expect(api.pluginsInstall).toHaveBeenCalledWith({ name: 'My MCP server', source: { kind: 'remote', args: [], url: 'https://mcp.example.org/mcp' }, credentials: { Authorization: 'Bearer x' } });
+});
+
+it('names this computer\'s own Plugins connector everywhere the page tells the user to act on it', async () => {
+  // One ChatGPT account on several computers: this computer's connector carries its suffix,
+  // and an instruction naming the plain one would send the user to the other computer's plugin.
+  const named = 'Chat On Steroids Plugins (Windows)';
+  const withName = (lastRequestAt: number | null) => ({ config: { tunnel: { kind: 'openai', pluginsTunnelId: '' } },
+    status: { surfaces: [{ id: 'plugins', state: 'off', connectorName: named, lastRequestAt, tools: [] }] } }) as unknown as AppState;
+  initPlugins(); await tick();
+  applyPluginsState(withName(null));
+  expect(document.getElementById('pluginsSetupHint')!.textContent).toBe(`Add the ${named} connector in ChatGPT once so it can use your installed plugins.`);
+  expect(document.querySelector('.plugin-refresh-guide')!.textContent).toContain(`refresh ${named} in ChatGPT`);
+  state.plugins[0]!.tools = [{ name: 'remember', exposedName: 'plugin_one_remember', enabled: true }];
+  await refreshPlugins(); document.querySelector<HTMLButtonElement>('.plugin-entry')!.click();
+  const toggle = document.querySelector<HTMLInputElement>('.plugin-tool input')!;
+  toggle.checked = false; toggle.dispatchEvent(new dom.window.Event('change')); await tick();
+  expect(document.querySelector('.toast')!.textContent).toContain(`Refresh the ${named} connector in ChatGPT`);
+  // The name survives a language change, and a later state without a name falls back to the plain one.
+  setLanguage('de');
+  expect(document.querySelector('.plugin-refresh-guide')!.textContent).toContain(named);
+  setLanguage('en');
+  applyPluginsState({ config: { tunnel: { kind: 'openai', pluginsTunnelId: '' } }, status: { surfaces: [] } } as unknown as AppState);
+  expect(document.querySelector('.plugin-refresh-guide strong')!.textContent).toBe('Chat On Steroids Plugins');
 });

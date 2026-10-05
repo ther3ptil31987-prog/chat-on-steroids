@@ -1,4 +1,5 @@
 import { offerToolInput, acknowledgeToolInput, TOOL_INPUT_HEADER } from '../session/input.js';
+import { noteConnectorUse } from '../connector-proof.js';
 import { pluginManager } from '../plugins/manager.js';
 import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-computer.js';
 /**
@@ -23,6 +24,7 @@ import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-compu
  */
 
 import { rawPromises as fs } from '../rawfs.js';
+import { randomUUID } from 'node:crypto';
 import { beginToolTiming, inboundRequestId, inboundPublication } from './inbound.js';
 import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
 import { z } from 'zod';
@@ -38,9 +40,10 @@ import {
   resolvePath,
   type Resolved
 } from '../sandbox.js';
-import { currentWorkspace, learnWorkspace, setCurrentWorkspace } from '../workspace.js';
+import { currentWorkspace, forgetMissingWorkspace, learnWorkspace, setCurrentWorkspace } from '../workspace.js';
 import { getSessionProject } from '../projects.js';
-import { firstTaskRoot } from '../skill-access.js';
+import { firstTaskRoot, resolveLinkedSkillAlias } from '../skill-access.js';
+import { isUserSkillVirtualPath, resolveUserSkillPath } from '../user-skills.js';
 import { ExecError } from '../exec.js';
 import { ComputerError } from '../computer/index.js';
 import { getConfig } from '../config.js';
@@ -54,6 +57,10 @@ import {
   reconcileAgentRequestOwners,
   dormantWorkerNotice,
   reactivateDormantRunForConversation,
+  reactivateSilentCeilingRunForTerminal,
+  recoverSilentCeilingWorker,
+  silentCeilingRecoveryAuthority,
+  silentCeilingWorkerNotice,
   endedWorkerNotice,
   hasDormantWorkerLeases,
   sleepSilentWorkers,
@@ -64,6 +71,7 @@ import {
   hasRetiredWorkerLeases,
   offerMessagesForCaller,
   persistCriticalSwarmNow,
+  workerPrimeOwner,
   requestWorkerRevivals,
   releaseQuiescentRun,
   retiredWorkerForConversation,
@@ -78,6 +86,7 @@ import {
   holdWhileSettling,
   runInCallContext,
   runningToolProgress,
+  setRequestOwner,
   trackInFlight,
   trackMcpRequest,
   type CallContext,
@@ -89,10 +98,13 @@ import {
   evidenceWindow,
   freshCallOrigin,
   recordAgentMessage,
+  recordProgress,
   recordToolCall
 } from '../session/recorder.js';
 import { requestCorrelation } from '../session/correlation.js';
-import { BLOCKED_CHAT_REFUSAL, anyChatBlocked, isChatBlocked } from '../session/blocked-chats.js';
+import { summarizeRunningCall } from '../session/summarize.js';
+import { anyChatBlocked, BLOCKED_CHAT_REFUSAL, isChatBlocked } from '../session/blocked-chats.js';
+import { STRICT_CHAT_REFUSAL, conversationAccessRefusal, strictChatAllowlistEnabled } from '../session/conversation-access.js';
 import { anyContinuationOpen, compactingConversation } from '../session/continuation.js';
 import {
   acknowledgeBackgroundExecOutput,
@@ -102,12 +114,95 @@ import {
 } from '../codex/ownership.js';
 import { DEFAULT_MAX_OUTPUT_TOKENS } from '../codex/unified-exec-constants.js';
 import { unattributedRepairEta } from '../bridge.js';
-import { conversationAttachment, readOverflowText } from '../session/store.js';
+import {
+  conversationAttachment,
+  findSessionByConversation,
+  getSession,
+  requestBelongsToActiveTurn,
+  requestTurnOwnershipCutoff
+} from '../session/store.js';
 import { sessionFinishDeadline } from '../session/finish.js';
-import type { StoredText, ToolOutcome } from '../../shared/session.js';
+import type { ToolOutcome } from '../../shared/session.js';
+
+/** The page's exact proof of a request id, by which a running call counts for its chat. */
+const requestOwner = (requestId: string): string | null => requestCorrelation(requestId)?.conversationId ?? null;
+
+const UNTRUSTED_NOTICE =
+  'A tool call from an untrusted chat was refused. In the chat list, hover this chat in the sidebar and choose Trust (✓) to allow it.';
+const UNTRUSTED_WORKER_NOTICE =
+  'A tool call from a worker whose owning prime is not currently allowed was refused. In the chat list, hover the owning prime row in the sidebar and choose Trust (✓) if it is untrusted, or Release there if it is blocked.';
+const UNPROVEN_WORKER_NOTICE =
+  'A tool call from an app-created worker was refused because no unique owning prime is currently proven. Return to the owning prime in the chat list; once its row is known, hover it in the sidebar and choose Trust (✓), or Release there if it is blocked, then retry after the worker is attached or recovered there.';
+const WORKER_CONNECTION_PROFILE_REFUSAL =
+  'WORKER_CONNECTION_PROFILE_MISMATCH: this worker belongs to a different Chat On Steroids Setup profile. ' +
+  'No local tool was run. Return to the owning prime and switch back to the connection that created this worker family; ' +
+  'cross-profile worker routing is not automatic.';
+
+function workerConnectionProfileRefusal(caller: CallCaller): string | null {
+  const owner = caller.conversationId ? workerPrimeOwner(caller.conversationId) : null;
+  return owner?.owned && owner.setupProfileId && caller.setupProfileId &&
+    owner.setupProfileId !== caller.setupProfileId ? WORKER_CONNECTION_PROFILE_REFUSAL : null;
+}
+
+const untrustedNoticeEpisodes = new Map<string, true>();
+const UNTRUSTED_NOTICE_MAX = 128;
+
+/**
+ * One timeline-only explanation per continuous refusal episode.
+ *
+ * Recording requires the same exact request/session/conversation proof as the call itself. The
+ * key is reserved before awaits so parallel retries cannot race two rows into the transcript.
+ * A later exact call that is no longer strict-refused clears the episode and permits one future
+ * notice if the user revokes trust again.
+ */
+function untrustedRefusalEpisodeKey(context: CallContext): string | null {
+  const { caller } = context;
+  return caller.conversationId && caller.sessionId ? `${caller.sessionId}\0${caller.conversationId}` : null;
+}
+
+function clearUntrustedRefusalEpisode(context: CallContext): void {
+  const key = untrustedRefusalEpisodeKey(context);
+  if (key) untrustedNoticeEpisodes.delete(key);
+}
+
+async function recordUntrustedRefusalNotice(context: CallContext): Promise<void> {
+  const { caller } = context;
+  const key = untrustedRefusalEpisodeKey(context);
+  if (!key || !caller.conversationId || !caller.sessionId) return;
+  if (untrustedNoticeEpisodes.has(key)) return;
+  untrustedNoticeEpisodes.set(key, true);
+  const exact = requestCorrelation(caller.requestId);
+  if (exact?.conversationId !== caller.conversationId || exact.sessionId !== caller.sessionId ||
+      await conversationAttachment(caller.conversationId, caller.sessionId) !== 'current') {
+    untrustedNoticeEpisodes.delete(key);
+    return;
+  }
+  const worker = workerPrimeOwner(caller.conversationId);
+  const durableWorker = worker.owned
+    ? false
+    : (await getSession(caller.sessionId).catch(() => null))?.origin?.kind === 'worker';
+  const message = worker.owned
+    ? worker.primeConversationId ? UNTRUSTED_WORKER_NOTICE : UNPROVEN_WORKER_NOTICE
+    : durableWorker ? UNPROVEN_WORKER_NOTICE : UNTRUSTED_NOTICE;
+  // A progress id is a presentation identity: reusing it would make foldProgress() collapse a
+  // later refusal episode into the old row. The in-memory exact-pair map does deduplication;
+  // the durable row therefore gets a fresh identity for each episode.
+  const recorded = await recordProgress(caller.sessionId, `strict-chat-refusal:${randomUUID()}`, message);
+  if (!recorded) {
+    untrustedNoticeEpisodes.delete(key);
+    return;
+  }
+  while (untrustedNoticeEpisodes.size > UNTRUSTED_NOTICE_MAX) {
+    const oldest = untrustedNoticeEpisodes.keys().next().value as string | undefined;
+    if (!oldest) break;
+    untrustedNoticeEpisodes.delete(oldest);
+  }
+}
 
 export interface ToolContext {
   exposedFinishTool?: boolean;
+  /** Stable Setup-profile provenance captured by the MCP endpoint generation. */
+  setupProfileId?: string;
   roots: Root[];
   /** Capabilities currently allowed by the live settings. */
   caps: Capabilities;
@@ -187,7 +282,7 @@ async function withIdentityRecoveredNotice(context: CallContext, result: ToolRes
   // Recheck live restrictions after the await, including identity learned during a handler.
   if (isChatBlocked(caller.conversationId) || compactingConversation(caller.conversationId) ||
       retiredWorkerForConversation(caller.conversationId) || dormantWorkerNotice(caller.conversationId) ||
-      endedWorkerNotice(caller.conversationId)) return result;
+      silentCeilingWorkerNotice(caller.conversationId) || endedWorkerNotice(caller.conversationId)) return result;
   const pending: Array<{ tools: Set<string>; offer?: CallContext['publication'] }> = [];
   for (const [requestId, entry] of identityRecovery) {
     if (entry.offer && !entry.offer.failed) {
@@ -252,6 +347,7 @@ export function lastToolCallAt(surface?: SurfaceId): number | null {
 /** Cleared with the server, so the answer is always about the current session. */
 export function resetToolClock(): void {
   identityRecovery.clear();
+  untrustedNoticeEpisodes.clear();
   toolCallSeenAt = null;
   surfaceToolCallAt.clear();
   transportIdentity = { checked: false, present: false };
@@ -494,10 +590,14 @@ function withInbox(
   const messages = scoped?.messages ?? [];
   if (messages.length === 0) return result;
   const lines = messages
-    .map(
-      (message) =>
-        `• ${message.from}${message.runId ? ` [run_id=${message.runId}]` : ''}${message.offers > 1 ? ' (delivery retry)' : ''}: ${message.text}`
-    )
+    .map((message) => {
+      const route = message.fromRunId
+        ? ` [source_run_id=${message.fromRunId}]${message.runId ? ` [received_on_run_id=${message.runId}]` : ''}`
+        : message.runId
+          ? ` [run_id=${message.runId}]`
+          : '';
+      return `• ${message.from}${route}${message.offers > 1 ? ' (delivery retry)' : ''}: ${message.text}`;
+    })
     .join('\n');
   return {
     ...result,
@@ -526,7 +626,8 @@ export async function dispatch(
   requestId: string | null,
   surface: SurfaceId,
   run: () => Promise<ToolResult>,
-  parent?: CallContext
+  parent?: CallContext,
+  setupProfileId: string | null = null
 ): Promise<ToolResult> {
   // The context is built here, one layer out from where the work happens, because the
   // compaction barrier asks about the whole request and not just the handler. A call is
@@ -537,13 +638,18 @@ export async function dispatch(
   const context: CallContext = {
     publication: parent?.publication ?? inboundPublication() ?? { completedAt: null, failed: false },
     startedAt: Date.now(),
+    activity: summarizeRunningCall(name, args, emptyEvidence()),
     transportKey,
     agent: null,
     allowUnattributed: getConfig().multiAgent.allowUnattributedCalls,
-    caller: parent ? { ...parent.caller } : { transportKey, requestId, conversationId: null, sessionId: null },
+    caller: parent
+      ? { ...parent.caller }
+      : { transportKey, requestId, conversationId: null, sessionId: null, setupProfileId },
     outcome: null,
     evidence: emptyEvidence()
   };
+  // Every call runs through here, so the proof is installed before any call can be running.
+  setRequestOwner(requestOwner);
   try {
     const result = await trackMcpRequest(() =>
       trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run, !!parent))
@@ -587,6 +693,7 @@ async function dispatchTracked(
   // answered, and "was this connector ever actually used from ChatGPT" is a per-connector
   // question the setup screen has to answer honestly.
   surfaceToolCallAt.set(surface, Date.now());
+  noteConnectorUse(surface, 'tool');
   const isFinish = isFinishCall(name, args);
   const startedAt = context.startedAt;
   const allowUnattributed = context.allowUnattributed === true;
@@ -674,7 +781,11 @@ async function dispatchTracked(
   // now means the page never proved it, not that the page had not proved it yet.
   //
   // A chat being compacted is refused on the same terms, so it waits on the same terms.
-  if (!context.caller.conversationId && (anyChatBlocked() || anyContinuationOpen()) && requestId) {
+  if (
+    !context.caller.conversationId &&
+    (strictChatAllowlistEnabled() || anyChatBlocked() || anyContinuationOpen()) &&
+    requestId
+  ) {
     setCallerConversation(
       context,
       await awaitFreshCallOrigin(name, startedAt, identityWindow(REQUEST_ID_GRACE_MS), { requestId })
@@ -683,6 +794,16 @@ async function dispatchTracked(
   const supersededConversation = context.caller.conversationId
     ? (await conversationAttachment(context.caller.conversationId, context.caller.sessionId ?? null)) === 'superseded'
     : false;
+  // Preserve the pre-strict fast path exactly: when strict mode is off, Block is a synchronous
+  // exact-chat lookup and ordinary calls do not acquire extra microtask yields. Interactive PTYs
+  // are timing-sensitive enough that needless awaits can change which terminal frame a poll sees.
+  // Connection provenance is an admission fence, not just a handler error: a refused call
+  // must not revive its worker or consume/receive input owned by the other connection.
+  const conversationPolicyRefusal = (strictChatAllowlistEnabled()
+    ? await conversationAccessRefusal(context.caller.conversationId)
+    : isChatBlocked(context.caller.conversationId) ? BLOCKED_CHAT_REFUSAL : null) ??
+    workerConnectionProfileRefusal(context.caller);
+  let silentFinishAuthorized = false;
   // Two things about liveness, both before the agent is resolved so that the answer this
   // call gets is the state this call itself established.
   //
@@ -697,11 +818,48 @@ async function dispatchTracked(
   // thought asleep takes the free execution slot back for that family, so the liveness
   // bookkeeping below sees the same run it would have seen had the parking not happened. A
   // chat the user stopped from the app is refused below anyway and reclaims nothing.
-  if (!supersededConversation && !isFinish && !isChatBlocked(context.caller.conversationId)) {
-    reactivateDormantRunForConversation(context.caller.conversationId);
+  if (!supersededConversation && !conversationPolicyRefusal) {
+    const conversationId = context.caller.conversationId;
+    const recoveryAuthority = silentCeilingRecoveryAuthority(conversationId);
+    let recovered = false;
+    if (conversationId && recoveryAuthority && requestId) {
+      const session = await findSessionByConversation(conversationId, { requireUnique: true });
+      if (
+        session &&
+        await requestBelongsToActiveTurn(
+          session.id,
+          conversationId,
+          requestId,
+          recoveryAuthority.turnId,
+          recoveryAuthority.requestOriginMax
+        )
+      ) {
+        // An exact late finish is terminal evidence, so restore its old turn without publishing
+        // the transient "still working" correction before the finish handler closes it.
+        if (isFinish) {
+          silentFinishAuthorized = reactivateSilentCeilingRunForTerminal(conversationId);
+          recovered = silentFinishAuthorized;
+        } else {
+          recovered = Boolean(recoverSilentCeilingWorker(conversationId, recoveryAuthority.turnId, true));
+        }
+      }
+    }
+    if (!recovered && !isFinish) reactivateDormantRunForConversation(conversationId);
   }
-  const alive = supersededConversation || isChatBlocked(context.caller.conversationId) ? null : noteAgentAlive(context.caller.conversationId);
-  const quietWorkers = supersededConversation ? [] : sleepSilentWorkers(Date.now(), undefined, id => runningToolProgress(id) !== null);
+  const alive = supersededConversation || conversationPolicyRefusal ? null : noteAgentAlive(context.caller.conversationId);
+  const callerSession = !supersededConversation && !conversationPolicyRefusal && context.caller.conversationId
+    ? await findSessionByConversation(context.caller.conversationId, { requireUnique: true }).catch(() => null)
+    : null;
+  const callerRequestOriginMax = callerSession && context.caller.conversationId
+    ? await requestTurnOwnershipCutoff(callerSession.id, context.caller.conversationId).catch(() => null)
+    : null;
+  const quietWorkers = supersededConversation || conversationPolicyRefusal ? [] : sleepSilentWorkers(
+    Date.now(),
+    undefined,
+    id => runningToolProgress(id) !== null,
+    id => callerSession?.conversationId === id ? callerSession.activeTurnId ?? null : undefined,
+    id => callerSession?.conversationId === id ? callerRequestOriginMax : undefined
+  );
   for (const quiet of quietWorkers) {
     if (quiet.report) await recordAgentMessage(quiet.report, 'sent', quiet.info.conversationId);
   }
@@ -741,6 +899,13 @@ async function dispatchTracked(
   }
   context.agent = isFinish ? agentForFinishCaller(context.caller) : agentForCaller(context.caller);
   const retiredWorker = retiredWorkerForConversation(context.caller.conversationId);
+  // A ceiling-silenced worker is deliberately neither reusable nor terminal. The only ordinary
+  // call allowed through is one whose request id proved the exact retained turn and therefore
+  // cleared the marker above. Conversation identity by itself is not enough: a new user turn in
+  // the same chat must remain fenced from local tools.
+  const silentCeilingWorker = isFinish && silentFinishAuthorized
+    ? null
+    : silentCeilingWorkerNotice(context.caller.conversationId);
   // Parking a run releases its global execution claim without retiring its worker chats. Those
   // exact conversations remain workers, though: a stale sleeping/terminal worker tab must not
   // turn into an ordinary unidentified chat and keep running local tools merely because another
@@ -759,7 +924,6 @@ async function dispatchTracked(
   // a lifecycle state the broker derived: somebody looked at a rogue turn they could not stop
   // from the page and stopped it here instead, so it applies to every tool on every surface,
   // `agents` finish included. A blocked chat has nothing left to finish.
-  const blockedChat = isChatBlocked(context.caller.conversationId);
   // A chat whose session is on its way to a fresh chat. Compact & Resume interrupts the turn
   // from the page and waits for the app's in-flight count to reach zero, but neither is a
   // fact about the model: ChatGPT's Stop control can vanish while the server-side turn goes
@@ -770,7 +934,7 @@ async function dispatchTracked(
   // every call passes: from the moment the continuation is filed until its commit hands the
   // chat over to `superseded`, chat A gets no tool at all, and each refusal tells the model
   // the only thing it can usefully do is write the brief.
-  const compacting = !blockedChat && compactingConversation(context.caller.conversationId) !== null;
+  const compacting = !conversationPolicyRefusal && compactingConversation(context.caller.conversationId) !== null;
   const retiredLeaseAmbiguous =
     !allowUnattributed && hasRetiredWorkerLeases() && !context.caller.conversationId;
   const dormantLeaseAmbiguous =
@@ -781,14 +945,34 @@ async function dispatchTracked(
   // Refuse and let the model retry once page evidence is healthy instead.
   // The arrival of this exact call acknowledges earlier injected input before the
   // handler reads the queue. New queued input is still offered only with its result.
-  if (!nested) await acknowledgeToolInput(context.caller.sessionId, context.caller.conversationId, requestId, startedAt)
+  if (!nested && !workerConnectionProfileRefusal(context.caller)) await acknowledgeToolInput(context.caller.sessionId, context.caller.conversationId, requestId, startedAt)
     .catch(() => logWarn('Prior user input receipt could not be saved; its existing claim is preserved'));
-  if (!nested && requestId && !blockedChat && !supersededConversation && !compacting) {
+  // Permission can change while the liveness/recovery bookkeeping above awaits disk or browser
+  // evidence. A prior refusal is monotonic, while a new revoke must take effect before any
+  // background result is acknowledged or the requested handler is entered.
+  let preAckPolicyRefusal = conversationPolicyRefusal;
+  if (!preAckPolicyRefusal && strictChatAllowlistEnabled()) {
+    preAckPolicyRefusal = await conversationAccessRefusal(context.caller.conversationId);
+  }
+  if (!nested && requestId && !preAckPolicyRefusal && !supersededConversation && !compacting) {
     const explicitPoll = name === 'write_stdin' && args && typeof args === 'object'
       ? (args as { session_id?: number }).session_id : undefined;
     const principal = executionPrincipal(requestId, context.caller.sessionId, allowUnattributed);
     await acknowledgeBackgroundExecOutput(principal, startedAt, explicitPoll);
   }
+  let admissionRefusal = preAckPolicyRefusal;
+  if (!admissionRefusal && strictChatAllowlistEnabled()) {
+    admissionRefusal = await conversationAccessRefusal(context.caller.conversationId);
+  }
+  if (!admissionRefusal) {
+    // Make the final policy decision with no intervening await before the handler is entered.
+    // This is the revoke race's last fence. Only a final allow ends a prior refusal episode.
+    if (strictChatAllowlistEnabled()) {
+      admissionRefusal = await conversationAccessRefusal(context.caller.conversationId);
+    }
+    if (!admissionRefusal) clearUntrustedRefusalEpisode(context);
+  }
+  if (admissionRefusal === STRICT_CHAT_REFUSAL) await recordUntrustedRefusalNotice(context);
   let handlerRan = false;
   markTiming('identity');
   const invokeHandler = (): Promise<ToolResult> => {
@@ -796,8 +980,8 @@ async function dispatchTracked(
     return run();
   };
   const result = await runInCallContext(context, () =>
-      blockedChat
-        ? Promise.resolve(fail(BLOCKED_CHAT_REFUSAL))
+      admissionRefusal
+        ? Promise.resolve(fail(admissionRefusal))
         : compacting
         ? Promise.resolve(fail(COMPACTION_IN_PROGRESS_REFUSAL))
         : supersededConversation
@@ -806,6 +990,8 @@ async function dispatchTracked(
               'CONVERSATION_SUPERSEDED: Compact & Resume replaced this ChatGPT conversation. Its transcript remains readable, but it can no longer execute local tools. Continue only in the replacement chat; no local tool was run.'
             )
           )
+        : silentCeilingWorker
+        ? Promise.resolve(fail(silentCeilingWorker))
         : dormantWorker
         ? Promise.resolve(fail(dormantWorker))
         : retiredWorker
@@ -850,7 +1036,12 @@ async function dispatchTracked(
   await reconcileAgentRequestOwners().catch(error => {
     logWarn(`Worker ownership recovery deferred after tool completion: ${error instanceof Error ? error.message : String(error)}`);
   });
-  const deliveryFenced = blockedChat || compacting || supersededConversation || isChatBlocked(context.caller.conversationId) ||
+  const deliveryPolicyRefusal = (strictChatAllowlistEnabled()
+    ? await conversationAccessRefusal(context.caller.conversationId)
+    : isChatBlocked(context.caller.conversationId) ? BLOCKED_CHAT_REFUSAL : null) ??
+    workerConnectionProfileRefusal(context.caller);
+  const deliveryFenced = Boolean(conversationPolicyRefusal) || compacting || supersededConversation || Boolean(silentCeilingWorker) ||
+    Boolean(deliveryPolicyRefusal) ||
     compactingConversation(context.caller.conversationId) !== null || Boolean(context.caller.conversationId &&
       (await conversationAttachment(context.caller.conversationId, context.caller.sessionId ?? null)) === 'superseded');
   // Never erase an identity a handler proved more strongly (agents::callerNow). The old
@@ -1052,22 +1243,39 @@ function isFinishCall(name: string, args: unknown): boolean {
  * retry rather than reaching the wrong file.
  */
 async function validatedWorkspace() {
+  return (await liveWorkspace()).workspace;
+}
+
+/** The workspace, plus the virtual path of a learned one just dropped because its folder is gone. */
+async function liveWorkspace(): Promise<{ workspace: { virtual: string; real: string } | null; missing: string | null }> {
   const sessionId = currentCall()?.caller.sessionId;
   // Explicit project bindings are durable authority, even after a cwd was learned.
   // Validate first so a revoked or moved project never becomes a first-root fallback.
   const project = sessionId ? await getSessionProject(sessionId) : null;
   if (project) {
     setCurrentWorkspace(project);
-    return project;
+    return { workspace: project, missing: null };
   }
-  return currentWorkspace();
+  const learned = currentWorkspace();
+  if (!learned) return { workspace: null, missing: null };
+  // A learned folder can be deleted while its chat sleeps. Keeping it would make every
+  // relative path and every command without a workdir fail with "Not found" for that folder.
+  const exists = await fs.stat(learned.real).then((stat) => stat.isDirectory(), () => false);
+  if (exists) return { workspace: learned, missing: null };
+  forgetMissingWorkspace(learned.real);
+  return { workspace: null, missing: learned.virtual };
 }
 
 export async function resolveIn(
   roots: Parameters<typeof resolvePath>[0],
   requested: string,
-  options: { allowMissing?: boolean; base?: string | null } = {}
+  options: { allowMissing?: boolean; base?: string | null; access?: 'read' } = {}
 ): Promise<Resolved> {
+  // The user's own Skill folders are served only to read tools, and never become a workspace.
+  if (isUserSkillVirtualPath(requested)) {
+    if (options.access !== 'read') throw new SandboxError(`${requested} is a read-only Skill folder. Copy the Skill into an approved folder to change it.`);
+    return (await resolveUserSkillPath(requested))!;
+  }
   // An explicit adapter-supplied base beats the workspace; otherwise the workspace is the base.
   // Either way the joining happens inside `resolvePath`, ahead of validation,
   // so a `..` in the caller's text still meets `checkSegment` instead of being normalised
@@ -1076,10 +1284,12 @@ export async function resolveIn(
   // `/elsewhere`, and nothing downstream can tell it apart from a path that was always that.
   const workspace = await validatedWorkspace();
   const base = options.base !== undefined ? options.base : (workspace?.virtual ?? null);
-  const resolved = await resolvePath(roots, requested, {
+  const resolveOptions = {
     ...(options.allowMissing === undefined ? {} : { allowMissing: options.allowMissing }),
     base
-  });
+  };
+  const resolved = await resolveLinkedSkillAlias(roots, requested, resolveOptions) ??
+    await resolvePath(roots, requested, resolveOptions);
   // Absolute only: a workspace learned from a relative path would let one loose resolution
   // decide where the next loose resolution points. See workspace.ts.
   if (isAbsoluteVirtualPath(requested) || isNativeWindowsPath(requested)) await learnWorkspace(resolved);
@@ -1105,12 +1315,14 @@ export async function resolveCwd(ctx: ToolContext, virtualPath: string | undefin
   // The chat's own folder before the first root: a command with no `workdir` should run where the
   // chat has been working, which is the whole point of the workspace and is exactly the case
   // the note above describes going wrong.
-  const workspace = await validatedWorkspace();
+  const { workspace, missing } = await liveWorkspace();
   // Codex treats an explicitly empty workdir exactly like an omitted one.
   const provided = virtualPath !== undefined && virtualPath !== '';
   if (!provided && !workspace && swarmRunning()) {
     throw new SandboxError(
-      'WORKSPACE_REQUIRED: this multi-agent chat has no proven workspace. Supply an explicit approved workdir before running a command.'
+      missing
+        ? `WORKSPACE_REQUIRED: the folder this chat was working in (${missing}) no longer exists. Supply an explicit approved workdir before running a command.`
+        : 'WORKSPACE_REQUIRED: this multi-agent chat has no proven workspace. Supply an explicit approved workdir before running a command.'
     );
   }
   const fallback = firstTaskRoot(ctx.roots);
@@ -1249,8 +1461,15 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
         inputSchema: toolSchema(config.inputSchema),
         ...(config.outputSchema ? { outputSchema: toolSchema(config.outputSchema) } : {})
       }, ((args: never, mcpCtx?: McpCallContext) =>
-        dispatch(name, args, mcpCtx?.sessionId ?? null, requestIdOf(mcpCtx), surface, () =>
-          handler(args)
+        dispatch(
+          name,
+          args,
+          mcpCtx?.sessionId ?? null,
+          requestIdOf(mcpCtx),
+          surface,
+          () => handler(args),
+          undefined,
+          ctx.setupProfileId ?? null
         )) as never);
     },
     guarded(cap, name, fn) {
@@ -1277,17 +1496,6 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
 }
 
 // ------------------------------------------------------------------ formatters
-
-/**
- * Largest brief a handoff save will accept.
- *
- * Generous on purpose. A brief that hits this is a symptom — the compaction of a very
- * long session — and refusing it there would throw away the one artefact the whole flow
- * exists to produce. The bound is only to keep a runaway generation from being written
- * to disk unbounded; at roughly four characters per token this is comfortably past any
- * single ChatGPT answer.
- */
-export const MAX_HANDOFF_CHARS = 400_000;
 
 /**
  * How long a prime-role `agents` call waits for the calling chat to show its own block.
@@ -1328,26 +1536,6 @@ export const UNATTRIBUTED_DESKTOP_EVIDENCE_MS = evidenceWindow(250);
  * timeout, so a slow proof still comes back as a spawned run rather than as a dead call.
  */
 export const SPAWN_EVIDENCE_MS = evidenceWindow(30_000);
-
-/**
- * Recovers the complete text behind a stored field.
- *
- * A long tool argument or result is bounded inline in the log and written whole beside
- * it; this reads the whole one back so recovery means the exact payload rather than
- * its first eight thousand characters. `complete` is false only when even the overflow
- * copy could not be written, and the caller says so instead of implying otherwise.
- */
-export async function expandStored(
-  sessionId: string,
-  stored: StoredText
-): Promise<{ text: string; complete: boolean }> {
-  if (!stored.truncated) return { text: stored.text, complete: true };
-  if (stored.assetId) {
-    const full = await readOverflowText(sessionId, stored.assetId);
-    if (full !== null) return { text: full, complete: true };
-  }
-  return { text: stored.text, complete: false };
-}
 
 /** Splits on blank lines so a part never ends mid-sentence unless a block is huge. */
 export function chunkText(text: string, size: number): string[] {

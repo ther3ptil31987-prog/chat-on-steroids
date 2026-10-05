@@ -10,7 +10,7 @@ import {
   saveConfig,
   updateConfig
 } from '../src/main/config.js';
-import { DESKTOP_CAPABILITIES, type Capability } from '../src/shared/types.js';
+import { DESKTOP_CAPABILITIES, type Capability, type Config } from '../src/shared/types.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 let dir: string;
@@ -24,7 +24,64 @@ afterAll(async () => {
   await removeTempDir(dir);
 });
 
+describe('browser bridge port config', () => {
+  it('defaults fresh and legacy configs to Auto and round-trips every supported choice', async () => {
+    expect(defaultConfig().ui.browserBridgePort).toBe('auto');
+    const legacy = defaultConfig(); delete legacy.ui.browserBridgePort;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
+    expect((await loadConfig()).ui.browserBridgePort).toBe('auto');
+    for (const browserBridgePort of ['auto', 8765, 8766, 8767, 8768, 8769] as const) {
+      await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, browserBridgePort } });
+      expect((await loadConfig()).ui.browserBridgePort).toBe(browserBridgePort);
+    }
+  });
+  it.each([null, '', '8765', 'Auto', 0, 8764, 8770, 8765.5, true])('rejects an explicit invalid choice: %s', async value => {
+    const before = await fs.readFile(path.join(dir, 'config.json'), 'utf8');
+    await expect(saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, browserBridgePort: value as any } })).rejects.toThrow();
+    expect(await fs.readFile(path.join(dir, 'config.json'), 'utf8')).toBe(before);
+  });
+});
+
 describe('settings migration', () => {
+  it('defaults command policy enforcement off in allow mode and round-trips both modes', async () => {
+    expect(defaultConfig().commandAllowlist).toEqual({ enabled: false, mode: 'allow', rules: [] });
+    const legacy = defaultConfig() as Partial<ReturnType<typeof defaultConfig>>;
+    delete legacy.commandAllowlist;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
+    expect((await loadConfig()).commandAllowlist).toEqual({ enabled: false, mode: 'allow', rules: [] });
+
+    const legacyAllowlist = { ...defaultConfig(), commandAllowlist: { enabled: true, rules: ['git status'] } };
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacyAllowlist), 'utf8');
+    expect((await loadConfig()).commandAllowlist).toEqual({ enabled: true, mode: 'allow', rules: ['git status'] });
+
+    await saveConfig({ ...defaultConfig(), commandAllowlist: { enabled: true, mode: 'allow', rules: ['git diff *'] } });
+    expect((await loadConfig()).commandAllowlist).toEqual({ enabled: true, mode: 'allow', rules: ['git diff *'] });
+
+    const saved = await saveConfig({
+      ...defaultConfig(),
+      commandAllowlist: { enabled: true, mode: 'deny', rules: ['git status', 'git diff *'] }
+    });
+    expect(saved.commandAllowlist).toEqual({ enabled: true, mode: 'deny', rules: ['git status', 'git diff *'] });
+    await saveConfig({ ...saved, commandAllowlist: { ...saved.commandAllowlist, enabled: false } });
+    expect((await loadConfig()).commandAllowlist).toEqual({ enabled: false, mode: 'deny', rules: ['git status', 'git diff *'] });
+  });
+
+  it('rejects invalid command allowlist updates without replacing the saved config', async () => {
+    const valid = await saveConfig({ ...defaultConfig(), commandAllowlist: { enabled: true, mode: 'allow', rules: ['git status'] } });
+    const before = await fs.readFile(path.join(dir, 'config.json'), 'utf8');
+    await expect(saveConfig({ ...valid, commandAllowlist: { enabled: true, mode: 'deny', rules: ['git status; whoami'] } })).rejects.toThrow(/shell syntax/i);
+    expect(await fs.readFile(path.join(dir, 'config.json'), 'utf8')).toBe(before);
+  });
+
+  it('recovers conservatively from a malformed active command policy', async () => {
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({
+      ...defaultConfig(), commandAllowlist: { enabled: true, mode: 'deny', rules: ['git status; whoami'] }
+    }), 'utf8');
+    const loaded = await loadConfig();
+    expect(loaded).toMatchObject({ readOnly: true, commandAllowlist: { enabled: false, mode: 'allow', rules: [] } });
+    expect(loaded.capabilities.command).toBe(false);
+  });
+
   it('round-trips custom appearance and isolates malformed appearance from permissions', async () => {
     const { defaultAppearance } = await import('../src/shared/appearance.js');
     const config = defaultConfig(); config.readOnly = true; config.capabilities.command = false;
@@ -79,6 +136,47 @@ describe('settings migration', () => {
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, startAtLogin: true, autoConnect: false } });
     expect((await loadConfig()).ui).toMatchObject({ startAtLogin: true, autoConnect: false });
   });
+  it('keeps the local control API off for fresh, legacy and malformed configs while preserving explicit opt-in', async () => {
+    expect(defaultConfig().controlApi).toEqual({ enabled: false, allowActions: false });
+    const legacy = defaultConfig() as Partial<ReturnType<typeof defaultConfig>>; delete legacy.controlApi;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
+    expect((await loadConfig()).controlApi).toEqual({ enabled: false, allowActions: false });
+    // A config written when the API only had one switch has no allowActions and gets it off.
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), controlApi: { enabled: true } }), 'utf8');
+    expect((await loadConfig()).controlApi).toEqual({ enabled: true, allowActions: false });
+    await saveConfig({ ...defaultConfig(), controlApi: { enabled: true, allowActions: false } });
+    expect((await loadConfig()).controlApi.enabled).toBe(true);
+    // A bad value repairs to off without sending the rest of the file through recovery, which would
+    // make it read-only: `readOnly: false` surviving is the proof that it did not.
+    const malformed = { ...defaultConfig(), readOnly: false, controlApi: { enabled: 'yes' } };
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(malformed), 'utf8');
+    const loaded = await loadConfig();
+    expect(loaded.controlApi.enabled).toBe(false);
+    expect(loaded.readOnly).toBe(false);
+  });
+  it('grants message actions only with the API on, and repairs each switch on its own', async () => {
+    const load = async (controlApi: unknown) => {
+      await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), readOnly: false, controlApi }), 'utf8');
+      return loadConfig();
+    };
+    expect((await load({ enabled: true, allowActions: true })).controlApi).toEqual({ enabled: true, allowActions: true });
+    // Actions never outlive the API: a hand-edited pair loads as off.
+    expect((await load({ enabled: false, allowActions: true })).controlApi).toEqual({ enabled: false, allowActions: false });
+    // A bad allowActions cannot switch the API itself off, and a bad enabled takes both down.
+    expect((await load({ enabled: true, allowActions: 'yes' })).controlApi).toEqual({ enabled: true, allowActions: false });
+    expect((await load({ enabled: 'yes', allowActions: true })).controlApi).toEqual({ enabled: false, allowActions: false });
+    expect((await load({ allowActions: true })).controlApi).toEqual({ enabled: false, allowActions: false });
+    // Something that is not an object at all repairs the same way, and the rest of the file is kept.
+    for (const notAnObject of [null, [], 'yes', 7, true]) {
+      const loaded = await load(notAnObject);
+      expect(loaded.controlApi, JSON.stringify(notAnObject)).toEqual({ enabled: false, allowActions: false });
+      expect(loaded.readOnly, JSON.stringify(notAnObject)).toBe(false);
+    }
+    const kept = await load({ enabled: true, allowActions: 'yes' });
+    expect(kept.readOnly).toBe(false);
+    await saveConfig({ ...defaultConfig(), controlApi: { enabled: false, allowActions: true } });
+    expect((await loadConfig()).controlApi).toEqual({ enabled: false, allowActions: false });
+  });
   it('defaults automatic plugin refresh off for fresh and legacy settings while preserving explicit opt-in', async () => {
     expect(defaultConfig().ui.autoRefreshPlugins).toBe(false);
     const legacy = defaultConfig(); delete legacy.ui.autoRefreshPlugins;
@@ -86,6 +184,14 @@ describe('settings migration', () => {
     expect((await loadConfig()).ui.autoRefreshPlugins).toBe(false);
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: true } });
     expect((await loadConfig()).ui.autoRefreshPlugins).toBe(true);
+  });
+  it('defaults automatic Skill selection off for fresh and legacy settings while preserving explicit opt-in', async () => {
+    expect(defaultConfig().ui.autoSelectSkills).toBe(false);
+    const legacy = defaultConfig(); delete legacy.ui.autoSelectSkills;
+    await saveConfig(legacy);
+    expect((await loadConfig()).ui.autoSelectSkills).toBe(false);
+    await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoSelectSkills: true } });
+    expect((await loadConfig()).ui.autoSelectSkills).toBe(true);
   });
   it('defaults Goal and Loop to ChatGPT while preserving explicit backend choices', async () => {
     expect(defaultConfig().goal).toMatchObject({ backend: 'chatgpt', loopBackend: 'chatgpt' });
@@ -242,6 +348,40 @@ describe('settings migration', () => {
     expect(loaded.compaction.auto).toBe(true);
     expect(loaded.compaction.autoTokens).toBe(loaded.sessions.advisoryTokens);
     expect(loaded.compaction.autoTokens).toBe(400_000);
+    expect(loaded.compaction.handoffPrompt).toMatch(/10,000[–-]30,000 tokens/i);
+  });
+
+  it('defaults, validates and preserves the editable handoff prompt', async () => {
+    const config = defaultConfig();
+    const older = structuredClone(config) as Record<string, any>;
+    delete older.compaction.handoffPrompt;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(older), 'utf8');
+    expect((await loadConfig()).compaction.handoffPrompt).toBe(config.compaction.handoffPrompt);
+
+    await fs.writeFile(
+      path.join(dir, 'config.json'),
+      JSON.stringify({ ...config, compaction: { ...config.compaction, handoffPrompt: '   ' } }),
+      'utf8'
+    );
+    expect((await loadConfig()).compaction.handoffPrompt).toBe(config.compaction.handoffPrompt);
+
+    const custom = 'Preserve the exact next action and unresolved evidence. Keep the rest compact.';
+    await saveConfig({ ...config, compaction: { ...config.compaction, handoffPrompt: custom } });
+    expect((await loadConfig()).compaction.handoffPrompt).toBe(custom);
+  });
+
+  it('keeps the thorough handoff length for older and broken configs, and saves a choice', async () => {
+    const config = defaultConfig();
+    expect(config.compaction.handoffLength).toBe('thorough');
+    const older = structuredClone(config) as Record<string, any>;
+    delete older.compaction.handoffLength;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(older), 'utf8');
+    expect((await loadConfig()).compaction.handoffLength).toBe('thorough');
+    await fs.writeFile(path.join(dir, 'config.json'),
+      JSON.stringify({ ...config, compaction: { ...config.compaction, handoffLength: 'tiny' } }), 'utf8');
+    expect((await loadConfig()).compaction.handoffLength).toBe('thorough');
+    await saveConfig({ ...config, compaction: { ...config.compaction, handoffLength: 'short' } });
+    expect((await loadConfig()).compaction.handoffLength).toBe('short');
   });
 
   /**
@@ -385,6 +525,20 @@ describe('shipped defaults', () => {
     expect(defaultConfig().sessions).toMatchObject({ record: true, retainDays: 0 });
   });
 
+  it('keeps Chrome as the default browser on a first launch and moves no existing config', async () => {
+    // The built-in browser is opt-in, for new installs too.
+    await fs.rm(path.join(dir, 'config.json'), { force: true });
+    expect((await loadConfig()).ui.chatBrowser).toBe('chrome');
+    // Written before the choice existed: it reads as the Chrome it always used.
+    const older = defaultConfig() as Config;
+    delete (older.ui as Partial<Config['ui']>).chatBrowser;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(older), 'utf8');
+    expect((await loadConfig()).ui.chatBrowser).toBe('chrome');
+    // Nor does a damaged file switch anyone's browser.
+    await fs.writeFile(path.join(dir, 'config.json'), '{"roots":', 'utf8');
+    expect((await loadConfig()).ui.chatBrowser).toBe('chrome');
+  });
+
   it('loads a genuinely missing config with every portable Core capability enabled', async () => {
     await fs.rm(path.join(dir, 'config.json'), { force: true });
     const loaded = await loadConfig();
@@ -393,8 +547,13 @@ describe('shipped defaults', () => {
       expect(enabled, capability).toBe(expectedFreshCapability(capability, process.platform));
     }
     expect(loaded.multiAgent.enabled).toBe(true);
+    expect(loaded.multiAgent.globalMaxWorkers).toBe(0);
     expect(loaded.multiAgent.allowUnattributedCalls).toBe(true);
     expect(loaded.multiAgent.recoverAgentTabs).toBe(false);
+    // Waiting for a run's own workers is a workflow preference, not a first-launch exposure
+    // decision, so it starts off even where unattributed calls start on.
+    expect(loaded.multiAgent.waitForSubAgents).toBe(false);
+    expect(loaded.multiAgent.endSleepingWorkerProcesses).toBe(false);
   });
 
   it.each(['win32', 'darwin', 'linux'] as const)(
@@ -407,8 +566,12 @@ describe('shipped defaults', () => {
       }
       expect(config.multiAgent.enabled).toBe(true);
       expect(config.multiAgent.maxWorkers).toBe(2);
+      expect(config.multiAgent.globalMaxWorkers).toBe(0);
       expect(config.multiAgent.allowUnattributedCalls).toBe(true);
+      expect(config.multiAgent.strictChatAllowlist).toBe(false);
       expect(config.multiAgent.recoverAgentTabs).toBe(false);
+      expect(config.multiAgent.waitForSubAgents).toBe(false);
+      expect(config.multiAgent.endSleepingWorkerProcesses).toBe(false);
     }
   );
 
@@ -425,8 +588,12 @@ describe('shipped defaults', () => {
     expect(loaded.capabilities.command).toBe(false);
     expect(loaded.capabilities.control).toBe(false);
     expect(loaded.multiAgent.enabled).toBe(false);
+    expect(loaded.multiAgent.globalMaxWorkers).toBe(0);
     expect(loaded.multiAgent.allowUnattributedCalls).toBe(false);
+    expect(loaded.multiAgent.strictChatAllowlist).toBe(false);
     expect(loaded.multiAgent.recoverAgentTabs).toBe(false);
+    expect(loaded.multiAgent.waitForSubAgents).toBe(false);
+    expect(loaded.multiAgent.endSleepingWorkerProcesses).toBe(false);
     expect(loaded.readOnly).toBe(true);
   });
 
@@ -437,6 +604,16 @@ describe('shipped defaults', () => {
     expect(loaded.capabilities.command).toBe(false);
     expect(loaded.capabilities.control).toBe(false);
     expect(loaded.multiAgent.enabled).toBe(false);
+  });
+
+  it('keeps the global worker admission cap off for legacy configs and preserves an explicit opt-in', async () => {
+    const config = defaultConfig();
+    expect(config.multiAgent.globalMaxWorkers).toBe(0);
+    await saveConfig({
+      ...config,
+      multiAgent: { ...config.multiAgent, globalMaxWorkers: 5 }
+    });
+    expect((await loadConfig()).multiAgent.globalMaxWorkers).toBe(5);
   });
 
   it('does not persist obsolete recording-off or age-retention choices', async () => {
@@ -474,6 +651,16 @@ describe('shipped defaults', () => {
       multiAgent: { ...config.multiAgent, allowUnattributedCalls: true }
     });
     expect((await loadConfig()).multiAgent.allowUnattributedCalls).toBe(true);
+  });
+
+  it('keeps strict chat allowlisting opt-in across save and reload', async () => {
+    const config = defaultConfig();
+    expect(config.multiAgent.strictChatAllowlist).toBe(false);
+    await saveConfig({
+      ...config,
+      multiAgent: { ...config.multiAgent, strictChatAllowlist: true }
+    });
+    expect((await loadConfig()).multiAgent.strictChatAllowlist).toBe(true);
   });
 });
 
@@ -775,4 +962,15 @@ it.each(REASONING_EFFORTS)('retains canonical worker/helper effort %s across set
   const loaded = await loadConfig();
   expect(loaded.multiAgent.defaultReasoning).toBe(effort);
   expect(loaded.goal.helperReasoning).toBe(effort);
+});
+
+it('persists optional ordinary new-chat model defaults without inventing them for legacy config', async () => {
+  const config = defaultConfig();
+  expect(config.ui.defaultChatModel).toBeUndefined();
+  expect(config.ui.defaultChatReasoning).toBeUndefined();
+  Object.assign(config.ui, { defaultChatModel: 'gpt-5.6-sol', defaultChatReasoning: 'xhigh' });
+  await saveConfig(config);
+  const loaded = await loadConfig();
+  expect(loaded.ui.defaultChatModel).toBe('gpt-5.6-sol');
+  expect(loaded.ui.defaultChatReasoning).toBe('xhigh');
 });

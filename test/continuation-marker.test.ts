@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { describe, expect, it } from 'vitest';
-import { continuationMarkerOf } from '../src/shared/session.js';
+import { continuationMarkerOf, unescapeMarkdown } from '../src/shared/session.js';
 
 // The unbundled browser reader must agree with the main/store/renderer reader.
 const content = readFileSync(new URL('../extension/content.js', import.meta.url), 'utf8');
@@ -11,6 +11,8 @@ const declarations = content.split('\n').filter(line => /^\s*const CONTINUATION_
 if (begin < 0 || end < 0 || declarations.length !== 2) throw new Error('Continuation reader not found');
 const pageMarker = vm.runInNewContext(`${declarations.join('\n')}\n${content.slice(begin, end)}\nmarkedAs`) as
   (text: string) => RegExpMatchArray | null;
+const pageUnescape = vm.runInNewContext(`${declarations.join('\n')}\n${content.slice(begin, end)}\nunescapeMarkdown`) as
+  (text: string) => string;
 const token = '_0123456789abc-def';
 const clean = `[[CLF-RESUME:${token}]]`;
 
@@ -29,6 +31,18 @@ describe('continuation markers from native readback', () => {
     expect(text.slice(parsed!.marker.length)).toBe('\nKeep C:\\_work and the rest of the brief unchanged.');
   });
 
+  it('reads the marker of a message ChatGPT stored as Markdown because it mentions an app', () => {
+    // Measured 2026-10-01: with the Core mention, every line break of the handoff request came
+    // back as a hard break, `]]\` + newline, and the brief was never captured.
+    const text = `${clean}\\\n\\\nChat On Steroids is preparing a handoff\\-brief. [$chat-on-steroids-core](app://asdk_app_X1)`;
+    const parsed = continuationMarkerOf(text);
+    expect(parsed).toMatchObject({ kind: 'RESUME', token, marker: `${clean}\\\n` });
+    expect(pageMarker(text)?.[2]).toBe(token);
+    expect(continuationMarkerOf(`${clean}\\`)).toMatchObject({ token });
+    expect(continuationMarkerOf(`${clean}\\x`)).toBeNull();
+    expect(pageMarker(`${clean}\\x`)).toBeNull();
+  });
+
   it.each([
     clean.replace('0', '\\0'),
     clean.replace('a', '\\a'),
@@ -41,5 +55,20 @@ describe('continuation markers from native readback', () => {
   ])('refuses malformed or non-leading marker %s in both readers', text => {
     expect(continuationMarkerOf(text)).toBeNull();
     expect(pageMarker(text)).toBeNull();
+  });
+});
+
+describe('page readback unescaping', () => {
+  // #426: ChatGPT stores composer hard breaks as `\<newline>`; both readers must drop them.
+  it.each([
+    ['[[COS_CONTEXT:34]]\\\nYou are worker-1.\\\nRun it.', '[[COS_CONTEXT:34]]\nYou are worker-1.\nRun it.'],
+    ['a\\\r\nb', 'a\nb'],
+    ['Keep C:\\_work and \\* unchanged', 'Keep C:_work and * unchanged'],
+    ['no escapes here', 'no escapes here'],
+    // #821: an indented line's first space reads back as `&#x20;`; one inside a line stays.
+    ['&#x20;Indented\n&#x20; deeper\nkeep &#x20; here', ' Indented\n  deeper\nkeep &#x20; here']
+  ])('reads %j as %j in both readers', (raw, typed) => {
+    expect(unescapeMarkdown(raw)).toBe(typed);
+    expect(pageUnescape(raw)).toBe(typed);
   });
 });

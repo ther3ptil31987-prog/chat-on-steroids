@@ -3,20 +3,73 @@ import { readFile } from 'node:fs/promises';
 import { JSDOM } from 'jsdom';
 
 const html = await readFile(new URL('../extension/popup.html', import.meta.url), 'utf8');
+const i18nScript = await readFile(new URL('../extension/i18n.js', import.meta.url), 'utf8');
 const script = await readFile(new URL('../extension/popup.js', import.meta.url), 'utf8');
+const manifest = JSON.parse(await readFile(new URL('../extension/manifest.json', import.meta.url), 'utf8'));
 let popup: JSDOM | undefined;
 afterEach(() => { popup?.window.close(); });
 
-function openPopup() {
+function openPopup(messages: Record<string, string> = {}, uiLanguage = 'en') {
   popup = new JSDOM(html, { url: 'https://extension-popup.test/', runScripts: 'outside-only' });
   const unavailable = () => new Promise(() => undefined);
+  const getMessage = (key: string, substitutions?: string | string[]) => {
+    const message = messages[key];
+    if (!message) return '';
+    const values = substitutions === undefined ? [] : Array.isArray(substitutions) ? substitutions : [substitutions];
+    return message.replace(/\$([1-9])/g, (token, index: string) => values[Number(index) - 1] ?? token);
+  };
   Object.assign(popup.window, {
-    chrome: { runtime: { sendMessage: unavailable }, storage: { local: { get: unavailable } } },
+    chrome: {
+      i18n: { getMessage, getUILanguage: () => uiLanguage },
+      runtime: { sendMessage: unavailable },
+      storage: { local: { get: unavailable } }
+    },
     setInterval: () => 0
   });
+  popup.window.eval(i18nScript);
   popup.window.eval(script);
   return popup.window.document;
 }
+
+it('declares Chrome locale placeholders and loads the shared i18n helper before popup code', () => {
+  expect(manifest.default_locale).toBe('en');
+  expect(manifest.name).toBe('__MSG_extension_name__');
+  expect(manifest.description).toBe('__MSG_extension_description__');
+  expect(manifest.action.default_title).toBe('__MSG_extension_action_title__');
+  expect(manifest.content_scripts[0].js[0]).toBe('i18n.js');
+  expect(html.indexOf('src="i18n.js"')).toBeLessThan(html.indexOf('src="popup.js"'));
+  expect((html.match(/<script\b[^>]*>/gi) ?? []).every((tag) => /\bsrc=/.test(tag))).toBe(true);
+
+  openPopup();
+  expect((popup!.window as any).CLF_I18N.t('missing_key', 'Port $1', 8765)).toBe('Port 8765');
+});
+
+it('uses chrome.i18n for static and dynamic popup text in a non-English locale', () => {
+  const document = openPopup({
+    popup_section_session_capture: 'Oturum kaydı',
+    popup_state_app_reachable_port: 'Uygulamaya erişiliyor · Port $1',
+    popup_connect: 'Bağlan',
+    popup_copy_chat_id: 'Sohbet kimliğini kopyala',
+    popup_call_details: '$1 — bulundu $2 · uygulama alındısı $3 · sahip $4 · araç etkinliği $5',
+    popup_yes: 'evet',
+    popup_confirmed: 'doğrulandı',
+    popup_no_record: 'kayıt yok'
+  }, 'tr');
+
+  expect(document.documentElement.lang).toBe('tr');
+  expect(document.querySelector('[data-i18n="popup_section_session_capture"]')!.textContent).toBe('Oturum kaydı');
+  expect(document.getElementById('d-chat')!.getAttribute('aria-label')).toBe('Sohbet kimliğini kopyala');
+  (popup!.window as any).paintHeader({ connected: true, paired: true, compatible: true, port: 8765 });
+  expect(document.getElementById('state')!.textContent).toBe('Uygulamaya erişiliyor · Port 8765');
+  (popup!.window as any).paintHeader({ connected: true, paired: false, disconnected: true, compatible: true, port: 8765 });
+  expect(document.getElementById('retryBtn')!.textContent).toBe('Bağlan');
+
+  const requestId = 'wfr_raw_runtime_id';
+  (popup!.window as any).paintCalls({ trace: [{ requestId, read: 1, sent: 1, confirmed: true, tool: 'runtime_tool' }] });
+  const call = document.querySelector('.call')!;
+  expect(call.getAttribute('title')).toContain(`${requestId} — bulundu evet`);
+  expect(call.querySelector('.tool')!.textContent).toBe('runtime_tool');
+});
 
 it('reports only app reachability from compatible health and pairing', () => {
   const document = openPopup();
@@ -26,8 +79,43 @@ it('reports only app reachability from compatible health and pairing', () => {
   (popup!.window as any).paintHeader({ connected: true, paired: true, compatible: true, port: 8765 });
   expect(document.getElementById('state')!.textContent).toBe('App reachable · Port 8765');
   expect(document.getElementById('state')!.textContent).not.toContain('Connected');
+  const hint = document.getElementById('appHint') as HTMLElement;
+  expect(hint.hidden).toBe(true);
   (popup!.window as any).paintHeader({ connected: false });
   expect(document.getElementById('state')!.textContent).toBe('App not reachable');
+  // Unreachable is the state people report as "it doesn't work": say what to do, right there.
+  expect(hint.hidden).toBe(false);
+  expect(hint.textContent).toBe('Make sure Chat On Steroids is open on this computer. The companion connects on its own.');
+  expect(document.getElementById('unpairBtn')).toBeNull();
+  (popup!.window as any).paintHeader({ connected: true, paired: false, disconnected: true, compatible: true, port: 8765 });
+  expect(document.getElementById('retryBtn')!.textContent).toBe('Connect');
+  expect((document.getElementById('retryBtn') as HTMLButtonElement).hidden).toBe(false);
+  expect(hint.hidden).toBe(true);
+  (popup!.window as any).paintHeader({ connected: true, paired: true, compatible: true, port: 8765 });
+  expect(hint.hidden).toBe(true);
+});
+
+it('requests cookie permission from the transfer click and reports denial without sending a session', async () => {
+  const document = openPopup();
+  const win = popup!.window as any;
+  win.chrome.permissions = { request: async () => false };
+  const sent: any[] = [];
+  win.chrome.runtime.sendMessage = async (message: any) => {
+    sent.push(message);
+    return message.type === 'status' ? { connected: true, paired: true, compatible: true,
+      signInOffer: { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' } } : null;
+  };
+  await win.refresh();
+  expect(document.getElementById('signInTransfer')!.hidden).toBe(false);
+  document.getElementById('signInTransferBtn')!.click();
+  await expect.poll(() => document.getElementById('signInTransferResult')!.textContent).toContain('not allowed');
+  expect(sent.some(message => message.type === 'cos_sign_in_transfer')).toBe(false);
+  expect((document.getElementById('signInTransferBtn') as HTMLButtonElement).disabled).toBe(false);
+  win.chrome.runtime.sendMessage = async () => null;
+  await win.refresh();
+  expect(document.getElementById('signInTransfer')!.hidden).toBe(false);
+  expect(document.getElementById('signInTransferResult')!.textContent).toContain('not allowed');
+  expect((document.getElementById('signInTransferBtn') as HTMLButtonElement).disabled).toBe(true);
 });
 
 it('explains manual mismatch recovery with both versions', () => {

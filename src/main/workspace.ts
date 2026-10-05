@@ -32,7 +32,8 @@ import { rawPromises as fs } from './rawfs.js';
 import type { Root } from '../shared/types.js';
 import { currentCall } from './mcp/call-context.js';
 import { requestCorrelation } from './session/correlation.js';
-import { isSkillPath } from './skill-access.js';
+import { isSkillPath, isSkillVirtualPath } from './skill-access.js';
+import { isContained } from './sandbox.js';
 
 /** How long a learned workspace survives without being used or renewed. */
 const WORKSPACE_TTL_MS = 12 * 60 * 60 * 1000;
@@ -134,7 +135,7 @@ export function currentWorkspace(): Workspace | null {
 
 /** Sets the workspace for an explicit key. Used by resume and by worker inheritance. */
 export function setWorkspaceFor(key: string, workspace: Omit<Workspace, 'at'>): void {
-  if (isSkillPath(workspace.real)) return;
+  if (isSkillPath(workspace.real) || isSkillVirtualPath(workspace.virtual)) return;
   workspaces.set(key, { ...workspace, at: Date.now() });
   prune();
 }
@@ -229,6 +230,18 @@ export function moveChatWorkspace(fromConversationId: string, toConversationId: 
   return true;
 }
 
+/**
+ * Forgets a learned workspace whose folder no longer exists.
+ *
+ * A worker that slept while its temporary folder was deleted would otherwise run its first
+ * command after revival in that deleted folder and fail with "Not found". Request-scoped copies
+ * of the same folder go too, or the next exact call would recover it from them again.
+ */
+export function forgetMissingWorkspace(real: string): void {
+  for (const key of workspaceKeys()) if (workspaces.get(key)?.real === real) workspaces.delete(key);
+  for (const [key, held] of workspaces) if (key.startsWith('request:') && held.real === real) workspaces.delete(key);
+}
+
 /** Drops one conversation-scoped workspace without touching any agent-scoped mirror. */
 export function clearChatWorkspace(conversationId: string | null): boolean {
   if (!conversationId) return false;
@@ -321,8 +334,7 @@ export async function projectFolderOf(
   // Bounded by the virtual depth, so a malformed pair can never spin.
   for (let step = 0; step <= depth; step++) {
     // Never above the approved root: containment is the boundary, here as everywhere.
-    const relative = path.relative(rootReal, currentReal);
-    if (relative.startsWith('..') || path.isAbsolute(relative)) break;
+    if (!isContained(rootReal, currentReal)) break;
     if (await hasMarker(currentReal)) return { real: currentReal, virtual: currentVirtual };
     const parentReal = path.dirname(currentReal);
     if (parentReal === currentReal) break;
@@ -341,7 +353,7 @@ export async function projectFolderOf(
  * already proven it can reach.
  */
 export async function learnWorkspace(resolved: { real: string; virtual: string; root: Root }): Promise<void> {
-  if (isSkillPath(resolved.real)) return;
+  if (isSkillPath(resolved.real) || isSkillVirtualPath(resolved.virtual) || resolved.root.name.toLowerCase() === 'skills') return;
   if (!workspaceKey()) return;
   let rootReal: string;
   try {

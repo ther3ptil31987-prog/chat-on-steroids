@@ -7,6 +7,8 @@
  * the shape of all of it over the actual MCP endpoint.
  */
 
+import { readFileSync } from 'node:fs';
+import { JSDOM } from 'jsdom';
 import http from 'node:http';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -26,7 +28,7 @@ vi.mock('electron', () => ({
   shell: { openExternal: async () => undefined }
 }));
 
-const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
+const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const {
   AgentError,
   PRIME_ID,
@@ -39,6 +41,9 @@ const {
   currentRunId,
   dormantWorkerNotice,
   reactivateDormantRunForConversation,
+  recoverSilentCeilingWorker,
+  silentCeilingRecoveryAuthority,
+  silentCeilingRecoveryTurn,
   failAgent,
   finishAgent,
   finishWorkerConversation,
@@ -53,6 +58,9 @@ const {
   pendingWorkerSpawns,
   pauseSwarmForDisable,
   WORKER_SILENCE_MS,
+  PAGE_GENERATING_FRESH_MS,
+  WORKER_THINKING_MAX_MS,
+  notePageGenerating,
   endedWorkerNotice,
   sleepSilentWorkers,
   sleepWorker,
@@ -82,6 +90,7 @@ const {
   stageFinishAgent,
   stageWorkerConversationFinish,
   stageMessages,
+  stagePrimeMessage,
   stageSpawn,
   snapshotSwarm,
   spawn,
@@ -89,13 +98,15 @@ const {
   swarmState,
   swarmStateForCaller,
   statusForCaller,
+  waitingForSubAgents,
+  workerPrimeOwner,
   workerConversationGone,
   workerRevivalClaimed
 } = await import('../src/main/agents.js');
 const { startMcpServer } = await import('../src/main/mcp/server.js');
 const { runningToolCalls } = await import('../src/main/mcp/call-context.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
-const { findSessionByConversation, initSessionStore, readRecentEvents, resetSessionStoreForTests } = await import(
+const { findSessionByConversation, initSessionStore, readRecentEvents, requestTurnOwnershipCutoff, resetSessionStoreForTests } = await import(
   '../src/main/session/store.js'
 );
 const { recordChatObservations, resetRecorderForTests } = await import('../src/main/session/recorder.js');
@@ -105,11 +116,16 @@ const { makeTempDir, removeTempDir } = await import('./helpers.js');
 
 let dir: string;
 
-async function setEnabled(enabled: boolean, maxWorkers = 3, allowUnattributedCalls = false): Promise<void> {
+async function setEnabled(
+  enabled: boolean,
+  maxWorkers = 3,
+  allowUnattributedCalls = false,
+  globalMaxWorkers = 0
+): Promise<void> {
   const base = defaultConfig();
   await saveConfig({
     ...base,
-    multiAgent: { ...base.multiAgent, enabled, maxWorkers, allowUnattributedCalls }
+    multiAgent: { ...base.multiAgent, enabled, maxWorkers, allowUnattributedCalls, globalMaxWorkers }
   });
 }
 
@@ -201,6 +217,124 @@ function startWorker(id: string, conversationId = `c-${id}`): { caller: Caller }
 function fillContext(conversationId: string): void {
   noteAgentContextTokens(conversationId, WORKER_CONTEXT_CEILING_TOKENS);
 }
+
+describe('exact worker prime provenance', () => {
+  it('keeps the same exact prime through active, sleeping and dormant worker states', () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1', 'c-worker-provenance');
+    expect(workerPrimeOwner('c-worker-provenance')).toMatchObject({
+      owned: true, primeConversationId: PRIME_CHAT
+    });
+
+    finishAgent(worker.caller, 'done for now');
+    expect(swarmState().agents.find(agent => agent.id === 'worker-1')?.state).toBe('sleeping');
+    expect(workerPrimeOwner('c-worker-provenance')).toMatchObject({
+      owned: true, primeConversationId: PRIME_CHAT
+    });
+
+    expect(releaseQuiescentRun()).toBe(true);
+    expect(workerPrimeOwner('c-worker-provenance')).toMatchObject({
+      owned: true, primeConversationId: PRIME_CHAT
+    });
+  });
+
+  it('keeps terminal worker ownership after its slot is over and the family parks', () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1', 'c-worker-terminal-provenance');
+    fillContext('c-worker-terminal-provenance');
+    expect(finishAgent(worker.caller, 'finished at the ceiling').info.state).toBe('finished');
+    expect(workerPrimeOwner('c-worker-terminal-provenance')).toMatchObject({
+      owned: true, primeConversationId: PRIME_CHAT
+    });
+    expect(releaseQuiescentRun()).toBe(true);
+    expect(workerPrimeOwner('c-worker-terminal-provenance')).toMatchObject({
+      owned: true, primeConversationId: PRIME_CHAT
+    });
+  });
+
+  it('distinguishes same-named workers in independent prime families by exact conversation', async () => {
+    await setEnabled(true, 3);
+    const primeB = { conversationId: 'c-prime-provenance-b' };
+    const a = spawn({ caller: prime, workers: [{ task: 'A work' }] });
+    const b = spawn({ caller: primeB, workers: [{ task: 'B work' }] });
+    expect(bindConversation('worker-1', 'c-worker-provenance-a', a.runId)).toBe(true);
+    expect(bindConversation('worker-1', 'c-worker-provenance-b', b.runId)).toBe(true);
+
+    expect(workerPrimeOwner('c-worker-provenance-a')).toMatchObject({
+      owned: true, primeConversationId: PRIME_CHAT, runId: a.runId
+    });
+    expect(workerPrimeOwner('c-worker-provenance-b')).toMatchObject({
+      owned: true, primeConversationId: primeB.conversationId, runId: b.runId
+    });
+  });
+
+  it('moves worker authority with the broker prime transfer instead of retaining the source chat', async () => {
+    const { beginPrimeTransfer, freezePrimeTransfer, commitPrimeTransfer } = await import('../src/main/agents.js');
+    startSwarm(1);
+    startWorker('worker-1', 'c-worker-transfer-provenance');
+    expect(workerPrimeOwner('c-worker-transfer-provenance').primeConversationId).toBe(PRIME_CHAT);
+
+    expect(beginPrimeTransfer(PRIME_CHAT)).toBe(true);
+    expect(freezePrimeTransfer(PRIME_CHAT)).toBe('frozen');
+    expect(commitPrimeTransfer(PRIME_CHAT, 'c-prime-resumed-provenance')).toBe(true);
+    expect(workerPrimeOwner('c-worker-transfer-provenance')).toMatchObject({
+      owned: true, primeConversationId: 'c-prime-resumed-provenance'
+    });
+  });
+
+  it('fails closed for a published worker whose prime is still provisional and reports no owner for strangers', async () => {
+    await setEnabled(true, 3, true);
+    try {
+      const run = spawn({ caller: { requestId: 'provisional-prime-request' }, workers: [{ task: 'provisional work' }] });
+      expect(bindConversation('worker-1', 'c-worker-provisional', run.runId)).toBe(true);
+      expect(workerPrimeOwner('c-worker-provisional')).toMatchObject({
+        owned: true, primeConversationId: null, runId: run.runId
+      });
+      expect(workerPrimeOwner('c-never-owned')).toEqual({ owned: false, primeConversationId: null, runId: null });
+    } finally {
+      await setEnabled(true);
+    }
+  });
+});
+
+describe('worker family Setup-profile provenance', () => {
+  it('pins a fresh family to its creating profile across park/restart and refuses another profile', () => {
+    const profileA: Caller = { ...prime, setupProfileId: 'profile-a' };
+    const profileB: Caller = { ...prime, setupProfileId: 'profile-b' };
+    const run = spawn({ caller: profileA, workers: [{ task: 'A-owned work' }] });
+    expect(snapshotSwarm()?.activeRuns?.[0]?.setupProfileId).toBe('profile-a');
+
+    expect(() => spawn({ caller: profileB, workers: [{ task: 'must not cross profiles' }] }))
+      .toThrow(/CONNECTION_PROFILE_MISMATCH/);
+    expect(swarmState(run.runId).agents.filter(agent => agent.role === 'worker')).toHaveLength(1);
+
+    expect(bindConversation('worker-1', 'c-profile-a-worker', run.runId)).toBe(true);
+    finishAgent({ conversationId: 'c-profile-a-worker' }, 'A work done');
+    expect(releaseQuiescentRun({}, run.runId)).toBe(true);
+    const parked = snapshotSwarm()!;
+    expect(parked.dormantRuns?.[0]?.setupProfileId).toBe('profile-a');
+
+    resetAgentsForTests();
+    restoreSwarm(JSON.parse(JSON.stringify(parked)));
+    expect(() => spawn({ caller: profileB, workers: [{ task: 'still must not cross profiles' }] }))
+      .toThrow(/CONNECTION_PROFILE_MISMATCH/);
+    const resumed = spawn({ caller: profileA, workers: [{ task: 'same connection may extend its family' }] });
+    expect(snapshotSwarm()?.activeRuns?.find(owner => owner.runId === resumed.runId)?.setupProfileId).toBe('profile-a');
+  });
+
+  it('does not retroactively guess a profile for legacy family history', () => {
+    const run = spawn({ caller: prime, workers: [{ task: 'legacy-style work' }] });
+    const legacy = JSON.parse(JSON.stringify(snapshotSwarm()));
+    delete legacy.setupProfileId;
+    delete legacy.activeRuns[0].setupProfileId;
+    resetAgentsForTests();
+    restoreSwarm(legacy);
+
+    const extended = spawn({ caller: { ...prime, setupProfileId: 'profile-b' }, workers: [{ task: 'later work' }] });
+    expect(extended.runId).toBe(run.runId);
+    expect(snapshotSwarm()?.activeRuns?.[0]?.setupProfileId).toBeUndefined();
+  });
+});
 
 describe('worker chats the browser may close', () => {
   it('names the stopped worker chats beyond the ones most recently used, and no working one', async () => {
@@ -329,6 +463,49 @@ describe('spawning a run', () => {
   });
 });
 
+describe('a worker wake ChatGPT restored as the chat draft (#882)', () => {
+  // The extension recognizes leftover wakes by the closing sentence this module writes. Feed it
+  // the real text, so the two cannot drift apart.
+  const domWithDraft = (text: string) => {
+    const dom = new JSDOM('<form><div id="prompt-textarea" contenteditable="true"></div><div data-testid="composer-trailing-actions"><button type="button" data-testid="send-button">Send</button></div></form>',
+      { url: 'https://chatgpt.com/c/abc', runScripts: 'outside-only', pretendToBeVisual: true });
+    const box = dom.window.document.getElementById('prompt-textarea')!;
+    for (const paragraph of text.split(/\n\n/)) { const p = dom.window.document.createElement('p'); p.textContent = paragraph; box.append(p); }
+    Object.defineProperty(dom.window.HTMLElement.prototype, 'getClientRects', { value() { return [{ width: 10, height: 10 }]; } });
+    dom.window.document.execCommand = (command: string) => {
+      const range = dom.window.document.getSelection()?.rangeCount ? dom.window.document.getSelection()!.getRangeAt(0) : null;
+      if (command !== 'delete' || !range) return false;
+      range.deleteContents(); return true;
+    };
+    dom.window.eval(readFileSync(new URL('../extension/chatgpt-dom.js', import.meta.url), 'utf8'));
+    return { dom, box, api: (dom.window as unknown as { CLF_DOM: { clearRevivalResidue(): boolean; composerSubmitReady(): boolean } }).CLF_DOM };
+  };
+
+  it('lets the page reclaim an unsent wake, and only that', () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'first round done');
+    stageMessages(prime, [{ to: 'worker-1', text: 'Regenerate PAGE-EVID_MASTER_v0.2.csv; keep raw source_status.' }]).commit();
+    const wake = pendingWorkerRevivals()[0]!.text;
+
+    const left = domWithDraft(wake);
+    expect(left.api.composerSubmitReady()).toBe(false);
+    expect(left.api.clearRevivalResidue()).toBe(true);
+    expect(left.box.textContent).toBe('');
+    left.dom.window.close();
+
+    // Something a person added after the wake keeps the whole draft.
+    const edited = domWithDraft(`${wake} Also check the totals.`);
+    expect(edited.api.clearRevivalResidue()).toBe(false);
+    expect(edited.box.textContent).toContain('Also check the totals.');
+    edited.dom.window.close();
+
+    const own = domWithDraft('My own unsent note');
+    expect(own.api.clearRevivalResidue()).toBe(false);
+    own.dom.window.close();
+  });
+});
+
 describe('account-observed worker admission', () => {
   const choices = [{ id: '5.6', label: 'GPT-5.6 Sol', efforts: ['high', 'pro'] as const, aliases: ['gpt-5-6-thinking', 'gpt-5-6-pro'] }];
   let catalog: ReturnType<typeof vi.spyOn>;
@@ -369,12 +546,41 @@ describe('account-observed worker admission', () => {
     expect(swarmRunning()).toBe(false);
   });
 
-  it('validates effective app defaults before reservation', async () => {
+  it('uses ChatGPT\'s current reasoning, and says so, when the saved default effort is not offered', async () => {
     const base = defaultConfig();
     await saveConfig({ ...base, multiAgent: { ...base.multiAgent, enabled: true, defaultModel: '5.6', defaultReasoning: 'ultra' } });
     try {
-      expect(() => spawn({ caller: prime, workers: [{ task: 'defaults' }] })).toThrow(/reasoning_effort "ultra"/);
-      expect(swarmRunning()).toBe(false);
+      const result = spawn({ caller: prime, workers: [{ task: 'defaults' }] });
+      expect(result.created[0]).toMatchObject({ model: '5.6', reasoningEffort: null });
+      expect(result.defaultNotes).toEqual([expect.stringMatching(/default worker reasoning "ultra" saved in Settings is not offered for model "5.6"/)]);
+    } finally { await setEnabled(true); }
+  });
+
+  // #499: a default saved before 2.1.15 read picker lanes stopped matching, and every spawn failed.
+  // The same stale value is the picker label's hyphenated form of one unique family —
+  // it resolves to that family; explicit requests keep their strict id/alias check.
+  it('resolves a stale default display slug to its unique observed family, but keeps explicit requests strict', async () => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, multiAgent: { ...base.multiAgent, enabled: true, defaultModel: 'gpt-5.6-sol', defaultReasoning: 'high' } });
+    try {
+      const result = spawn({ caller: prime, workers: [{ task: 'stale default' }, { task: 'second' }] });
+      expect(result.created.map(worker => [worker.model, worker.reasoningEffort])).toEqual([['5.6', 'high'], ['5.6', 'high']]);
+      expect(result.defaultNotes ?? []).toEqual([]);
+      expect(() => spawn({ caller: prime, workers: [{ task: 'explicit', model: 'gpt-5.6-sol' }] })).toThrow(/not observed/);
+    } finally { await setEnabled(true); }
+  });
+
+  it('uses ChatGPT\'s current model when the saved default is ambiguous, but keeps explicit requests strict', async () => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, multiAgent: { ...base.multiAgent, enabled: true, defaultModel: '5.5', defaultReasoning: 'high' } });
+    vi.mocked(chatModels.getChatModels).mockReturnValue({ state: 'ready', requestedAt: null, observedAt: 1, models: [
+      { id: 'gpt-5-5-thinking', label: '5.5', efforts: ['medium', 'high'] },
+      { id: 'gpt-5-5-pro', label: '5.5', efforts: ['pro'] }
+    ] });
+    try {
+      const result = spawn({ caller: prime, workers: [{ task: 'ambiguous default' }] });
+      expect(result.created.map(worker => [worker.model, worker.reasoningEffort])).toEqual([[null, 'high']]);
+      expect(result.defaultNotes).toEqual([expect.stringMatching(/default worker model "5.5" saved in Settings is not offered/)]);
     } finally { await setEnabled(true); }
   });
 
@@ -829,6 +1035,52 @@ describe('a worker whose chat closed', () => {
     } finally { clock.mockRestore(); }
   });
 
+  it('keeps a worker awake while its own page says the turn is still thinking (#882)', () => {
+    startSwarm(1);
+    startWorker('worker-1');
+    const started = Date.now(), clock = vi.spyOn(Date, 'now');
+    try {
+      clock.mockReturnValue(started);
+      noteAgentAlive('c-worker-1', 'call');
+      // A long think: no call and no new output for half an hour, but the page polls on.
+      for (let at = 60_000; at <= 30 * 60_000; at += 60_000) {
+        clock.mockReturnValue(started + at);
+        notePageGenerating('c-worker-1', true);
+        expect(sleepSilentWorkers()).toEqual([]);
+      }
+      // The page saying so is not work: it never renews the work clock.
+      expect(swarmState().agents.find(agent => agent.id === 'worker-1')).toMatchObject({ state: 'active', lastSeenAt: started });
+      // The turn ended; silence counts again at once.
+      notePageGenerating('c-worker-1', false);
+      expect(sleepSilentWorkers()).toHaveLength(1);
+    } finally { clock.mockRestore(); }
+  });
+
+  it('does not let a page that went quiet or a turn open for hours hold a worker awake', () => {
+    startSwarm(2);
+    startWorker('worker-1');
+    startWorker('worker-2');
+    const started = Date.now(), clock = vi.spyOn(Date, 'now');
+    try {
+      clock.mockReturnValue(started);
+      noteAgentAlive('c-worker-1', 'call');
+      noteAgentAlive('c-worker-2', 'call');
+      notePageGenerating('c-worker-1', true);
+      // worker-1's page stopped polling (tab gone, browser closed): its last word goes stale.
+      expect(PAGE_GENERATING_FRESH_MS).toBeLessThan(WORKER_SILENCE_MS);
+      clock.mockReturnValue(started + WORKER_SILENCE_MS);
+      notePageGenerating('c-worker-2', true);
+      expect(sleepSilentWorkers().map(slept => slept.info.id)).toEqual(['worker-1']);
+      // worker-2 keeps saying it is generating, but past the cap that alone no longer counts.
+      clock.mockReturnValue(started + WORKER_THINKING_MAX_MS - 1);
+      notePageGenerating('c-worker-2', true);
+      expect(sleepSilentWorkers()).toEqual([]);
+      clock.mockReturnValue(started + WORKER_THINKING_MAX_MS);
+      notePageGenerating('c-worker-2', true);
+      expect(sleepSilentWorkers().map(slept => slept.info.id)).toEqual(['worker-2']);
+    } finally { clock.mockRestore(); }
+  });
+
   it('renews the three-minute deadline only for new accepted work, not replayed turn evidence', () => {
     startSwarm(1);
     startWorker('worker-1');
@@ -905,6 +1157,196 @@ describe('a worker whose chat closed', () => {
     const finished = swarmState().agents.find((agent) => agent.id === 'worker-1');
     expect(finished?.revivable).toBe(false);
     expect(noteAgentAlive('c-worker-1', 'page')?.revived).toBe(false);
+  });
+
+  it('parks a ceiling worker on an unresolved turn without granting a new-task wake', () => {
+    startSwarm(1);
+    startWorker('worker-1');
+    fillContext('c-worker-1');
+    const now = Date.now();
+
+    const [parked] = sleepSilentWorkers(
+      now + WORKER_SILENCE_MS + 1,
+      undefined,
+      () => false,
+      () => 'turn-old'
+    );
+    expect(parked?.info).toMatchObject({
+      state: 'sleeping',
+      revivable: false,
+      silenceRecoveryTurnId: 'turn-old'
+    });
+    expect(freeWorkerSlots()).toBe(3);
+    expect(silentCeilingRecoveryTurn('c-worker-1')).toBe('turn-old');
+    expect(closableWorkerConversations(0)).not.toContain('c-worker-1');
+    expect(() => stageMessages(prime, [{ to: 'worker-1', text: 'new task' }])).toThrow(/context-limited|unresolved/i);
+    expect(noteAgentAlive('c-worker-1', 'call')?.revived).toBe(false);
+    expect(recoverSilentCeilingWorker('c-worker-1', 'turn-new')).toBeNull();
+
+    const recovered = recoverSilentCeilingWorker('c-worker-1', 'turn-old');
+    expect(recovered).toMatchObject({ agentId: 'worker-1', revived: true });
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'active',
+      revivable: false,
+      silenceRecoveryTurnId: null
+    });
+  });
+
+  it('parks rather than terminalizes missing turn identity at the ceiling', () => {
+    startSwarm(1);
+    startWorker('worker-1');
+    fillContext('c-worker-1');
+
+    expect(sleepSilentWorkers(
+      Date.now() + WORKER_SILENCE_MS + 1,
+      undefined,
+      () => false,
+      () => null
+    )).toHaveLength(1);
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'sleeping',
+      revivable: false,
+      silenceParked: true,
+      silenceRecoveryTurnId: null
+    });
+    expect(closableWorkerConversations(0)).not.toContain('c-worker-1');
+  });
+
+  it('clears a dormant ceiling-silence marker as explicit terminal user authority', () => {
+    startSwarm(1);
+    startWorker('worker-1', 'c-worker-clear-ceiling-park');
+    fillContext('c-worker-clear-ceiling-park');
+    sleepSilentWorkers(
+      Date.now() + WORKER_SILENCE_MS + 1,
+      undefined,
+      () => false,
+      () => 'turn-clear-ceiling-park',
+      () => 11
+    );
+    expect(releaseQuiescentRun()).toBe(true);
+
+    resetSwarm();
+
+    expect(retiredWorkerForConversation('c-worker-clear-ceiling-park')).toMatchObject({
+      id: 'worker-1',
+      conversationId: 'c-worker-clear-ceiling-park'
+    });
+    expect(silentCeilingRecoveryTurn('c-worker-clear-ceiling-park')).toBeNull();
+  });
+
+  it('preserves an ambiguous below-ceiling sleep when delayed accounting later crosses 400k', () => {
+    startSwarm(1);
+    startWorker('worker-1');
+    noteAgentContextTokens('c-worker-1', WORKER_CONTEXT_CEILING_TOKENS - 1);
+
+    const [slept] = sleepSilentWorkers(
+      Date.now() + WORKER_SILENCE_MS + 1,
+      undefined,
+      () => false,
+      () => 'turn-delayed-meter'
+    );
+    expect(slept?.info).toMatchObject({
+      state: 'sleeping',
+      revivable: true,
+      silenceRecoveryTurnId: 'turn-delayed-meter'
+    });
+
+    noteAgentContextTokens('c-worker-1', WORKER_CONTEXT_CEILING_TOKENS);
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'sleeping',
+      revivable: false,
+      silenceRecoveryTurnId: 'turn-delayed-meter'
+    });
+    expect(() => stageMessages(prime, [{ to: 'worker-1', text: 'new task' }])).toThrow(/context-limited|unresolved/i);
+  });
+
+  it('preserves exact ceiling-silence recovery authority across parked restore', () => {
+    startSwarm(1);
+    startWorker('worker-1');
+    fillContext('c-worker-1');
+    sleepSilentWorkers(
+      Date.now() + WORKER_SILENCE_MS + 1,
+      undefined,
+      () => false,
+      () => 'turn-old',
+      () => 17
+    );
+    releaseQuiescentRun();
+    const saved = snapshotSwarm()!;
+    resetAgentsForTests();
+    restoreSwarm(saved);
+
+    expect(silentCeilingRecoveryTurn('c-worker-1')).toBe('turn-old');
+    expect(silentCeilingRecoveryAuthority('c-worker-1')).toEqual({ turnId: 'turn-old', requestOriginMax: 17 });
+    expect(reactivateDormantRunForConversation('c-worker-1')).toBe(false);
+    expect(recoverSilentCeilingWorker('c-worker-1', 'turn-old')).toMatchObject({
+      agentId: 'worker-1',
+      revived: true
+    });
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('active');
+  });
+
+  it('keeps a ceiling-silenced worker fenced until its staged terminal snapshot commits', async () => {
+    startSwarm(1);
+    startWorker('worker-1');
+    fillContext('c-worker-1');
+    sleepSilentWorkers(
+      Date.now() + WORKER_SILENCE_MS + 1,
+      undefined,
+      () => false,
+      () => 'turn-terminal-stage',
+      () => 7
+    );
+    const staged = stageWorkerConversationFinish('c-worker-1', 'durably done')!;
+    const writes: Array<ReturnType<typeof snapshotSwarm>> = [];
+    onSwarmPersistNow(async snapshot => { writes.push(structuredClone(snapshot)); });
+
+    expect(await persistCriticalSwarmNow()).toBe(true);
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'sleeping',
+      silenceParked: true,
+      silenceRecoveryTurnId: 'turn-terminal-stage'
+    });
+    const durableWorker = writes.at(-1)?.activeRuns?.[0]?.agents.find((entry) => entry.info.id === 'worker-1')?.info;
+    expect(durableWorker).toMatchObject({
+      state: 'finished',
+      revivable: false,
+      silenceParked: false,
+      silenceRecoveryTurnId: null,
+      silenceRecoveryRequestOriginMax: null
+    });
+
+    staged.rollback();
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'sleeping',
+      revivable: false,
+      silenceParked: true,
+      silenceRecoveryTurnId: 'turn-terminal-stage'
+    });
+    onSwarmPersistNow(async () => undefined);
+  });
+
+  it('treats feature disable as terminal evidence for a ceiling-silenced worker', async () => {
+    startSwarm(1);
+    startWorker('worker-1');
+    fillContext('c-worker-1');
+    sleepSilentWorkers(
+      Date.now() + WORKER_SILENCE_MS + 1,
+      undefined,
+      () => false,
+      () => 'turn-old'
+    );
+    expect(releaseQuiescentRun()).toBe(true);
+
+    await setEnabled(false);
+    expect(pauseSwarmForDisable()).toBe(true);
+    const worker = snapshotSwarm()!.dormantRuns?.[0]?.agents.find((entry) => entry.info.id === 'worker-1');
+    expect(worker?.info).toMatchObject({
+      state: 'finished',
+      revivable: false,
+      silenceRecoveryTurnId: null
+    });
+    await setEnabled(true);
   });
 
   it('sleeps a detached worker only once it has also gone quiet, and reports that to prime', () => {
@@ -2495,6 +2937,7 @@ describe('through the MCP endpoint', () => {
       (tool) => tool.name === 'agents'
     )!.inputSchema;
     expect(schema.properties.action.enum.slice().sort()).toEqual(['finish', 'message', 'spawn', 'status']);
+    expect(schema.properties.target_run_id).toBeDefined();
     // Revive is gone from the wire as well as from the broker: no field survives for it.
     expect(Object.keys(schema.properties)).not.toContain('agent');
   });
@@ -2700,6 +3143,36 @@ describe('through the MCP endpoint', () => {
     expect(text).not.toContain(PRIME_CHAT);
   });
 
+  it('threads endpoint Setup-profile provenance into the family and fails closed on another profile', async () => {
+    toolContext.setupProfileId = 'profile-a';
+    const created = await structuredAsChat(PRIME_CHAT, 'spawn', { workers: [{ task: 'profile A work' }] });
+    const runId = String(created.run_id);
+    expect(runId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(snapshotSwarm()?.activeRuns?.find(owner => owner.runId === runId)?.setupProfileId).toBe('profile-a');
+    expect(bindConversation('worker-1', 'c-profile-wire-worker', runId)).toBe(true);
+
+    toolContext.setupProfileId = 'profile-b';
+    const primeRefused = await asChat(PRIME_CHAT, 'status');
+    expect(primeRefused).toContain('CONNECTION_PROFILE_MISMATCH');
+
+    const requestId = 'wfr_profile_b_worker_read';
+    await recordChatObservations('c-profile-wire-worker', [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-profile-b-worker' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-profile-b-worker',
+        calls: [{ messageId: 'm-profile-b-worker', tool: 'read', order: 0, answered: false, requestId }]
+      }
+    ]);
+    const workerRefused = textOfReply(await ordinaryWithRequestId(requestId, 'read', { paths: ['/anything'] }));
+    expect(workerRefused).toContain('WORKER_CONNECTION_PROFILE_MISMATCH');
+    expect(workerRefused).not.toMatch(REFUSED_ON_ROOTS);
+
+    toolContext.setupProfileId = 'profile-a';
+    expect(await asChat(PRIME_CHAT, 'status')).not.toContain('CONNECTION_PROFILE_MISMATCH');
+  });
+
   it('shows a parked prime only its own history while another prime owns the active run', async () => {
     spawn({ workers: [{ label: 'A history worker', task: 'A private task' }], caller: prime });
     expect(bindConversation('worker-1', 'c-worker-a')).toBe(true);
@@ -2877,13 +3350,271 @@ describe('through the MCP endpoint', () => {
     expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('active');
   });
 
+  it('recovers a dormant ceiling-silenced worker only from the exact retained request turn', async () => {
+    startSwarm(1);
+    startWorker('worker-1');
+    const requestId = 'wfr_ceiling_same_turn';
+    const turnId = 't-ceiling-same-turn';
+    await recordChatObservations('c-worker-1', [
+      { kind: 'turn_start', time: Date.now(), turnId },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId,
+        calls: [{ messageId: 'm-ceiling-same-turn', tool: 'read', order: 0, answered: false, requestId }]
+      }
+    ]);
+    expect(textOfReply(await ordinaryWithRequestId(requestId, 'read', { paths: ['/anything'] }))).toMatch(REFUSED_ON_ROOTS);
+    const session = await findSessionByConversation('c-worker-1', { requireUnique: true });
+    const cutoff = await requestTurnOwnershipCutoff(session!.id, 'c-worker-1');
+
+    fillContext('c-worker-1');
+    sleepSilentWorkers(
+      Date.now() + WORKER_SILENCE_MS + 1,
+      undefined,
+      () => false,
+      () => turnId,
+      () => cutoff
+    );
+    expect(releaseQuiescentRun()).toBe(true);
+    expect(silentCeilingRecoveryTurn('c-worker-1')).toBe(turnId);
+
+    const late = textOfReply(await ordinaryWithRequestId(requestId, 'read', { paths: ['/anything'] }));
+    expect(late).not.toContain('WORKER_CONTEXT_LIMITED');
+    expect(late).toMatch(REFUSED_ON_ROOTS);
+    expect(swarmRunning()).toBe(true);
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'active',
+      silenceRecoveryTurnId: null
+    });
+  });
+
+  it('refuses a new post-sleep turn in the same ceiling worker conversation', async () => {
+    startSwarm(1);
+    startWorker('worker-1');
+    const oldRequestId = 'wfr_ceiling_old_turn';
+    const oldTurnId = 't-ceiling-old-turn';
+    await recordChatObservations('c-worker-1', [
+      { kind: 'turn_start', time: Date.now(), turnId: oldTurnId },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: oldTurnId,
+        calls: [{ messageId: 'm-ceiling-old-turn', tool: 'read', order: 0, answered: false, requestId: oldRequestId }]
+      }
+    ]);
+    await ordinaryWithRequestId(oldRequestId, 'read', { paths: ['/anything'] });
+    const session = await findSessionByConversation('c-worker-1', { requireUnique: true });
+    const cutoff = await requestTurnOwnershipCutoff(session!.id, 'c-worker-1');
+    fillContext('c-worker-1');
+    sleepSilentWorkers(
+      Date.now() + WORKER_SILENCE_MS + 1,
+      undefined,
+      () => false,
+      () => oldTurnId,
+      () => cutoff
+    );
+    expect(releaseQuiescentRun()).toBe(true);
+
+    const newRequestId = 'wfr_ceiling_new_turn';
+    await recordChatObservations('c-worker-1', [
+      { kind: 'turn_start', time: Date.now() + 1, turnId: 't-ceiling-new-turn' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now() + 1,
+        turnId: 't-ceiling-new-turn',
+        calls: [{ messageId: 'm-ceiling-new-turn', tool: 'read', order: 0, answered: false, requestId: newRequestId }]
+      }
+    ]);
+    const refused = textOfReply(await ordinaryWithRequestId(newRequestId, 'read', { paths: ['/anything'] }));
+    expect(refused).toContain('WORKER_CONTEXT_LIMITED');
+    expect(refused).toContain('Nothing was run');
+    expect(swarmRunning()).toBe(false);
+    expect(silentCeilingRecoveryTurn('c-worker-1')).toBe(oldTurnId);
+  });
+
+  it('refuses ordinary tools from a null-marker ceiling park', async () => {
+    startSwarm(1);
+    startWorker('worker-1');
+    fillContext('c-worker-1');
+    sleepSilentWorkers(
+      Date.now() + WORKER_SILENCE_MS + 1,
+      undefined,
+      () => false,
+      () => null
+    );
+    expect(releaseQuiescentRun()).toBe(true);
+
+    const requestId = 'wfr_ceiling_null_marker_new';
+    await recordChatObservations('c-worker-1', [{
+      kind: 'tool_evidence',
+      time: Date.now() + 1,
+      turnId: 't-ceiling-null-marker-new',
+      calls: [{ messageId: 'm-ceiling-null-marker-new', tool: 'read', order: 0, answered: false, requestId }]
+    }]);
+    const refused = textOfReply(await ordinaryWithRequestId(requestId, 'read', { paths: ['/anything'] }));
+    expect(refused).toContain('WORKER_CONTEXT_LIMITED');
+    expect(refused).toContain('Nothing was run');
+    expect(refused).toContain('No complete pre-park request/turn recovery proof was retained');
+    expect(swarmRunning()).toBe(false);
+  });
+
+  it('does not let post-park request attribution manufacture same-old-turn authority', async () => {
+    startSwarm(1);
+    startWorker('worker-1');
+    const oldRequestId = 'wfr_ceiling_cutoff_old';
+    const oldTurnId = 't-ceiling-cutoff-old';
+    await recordChatObservations('c-worker-1', [
+      { kind: 'turn_start', time: Date.now(), turnId: oldTurnId },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: oldTurnId,
+        calls: [{ messageId: 'm-ceiling-cutoff-old', tool: 'read', order: 0, answered: false, requestId: oldRequestId }]
+      }
+    ]);
+    await ordinaryWithRequestId(oldRequestId, 'read', { paths: ['/anything'] });
+    const session = await findSessionByConversation('c-worker-1', { requireUnique: true });
+    const cutoff = await requestTurnOwnershipCutoff(session!.id, 'c-worker-1');
+    fillContext('c-worker-1');
+    sleepSilentWorkers(
+      Date.now() + WORKER_SILENCE_MS + 1,
+      undefined,
+      () => false,
+      () => oldTurnId,
+      () => cutoff
+    );
+    expect(releaseQuiescentRun()).toBe(true);
+
+    const newRequestId = 'wfr_ceiling_cutoff_new';
+    await recordChatObservations('c-worker-1', [
+      { kind: 'user_message', time: Date.now() + 1, messageId: 'new-question-without-turn-start', text: 'new task' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now() + 2,
+        turnId: oldTurnId,
+        calls: [{ messageId: 'm-ceiling-cutoff-new', tool: 'read', order: 0, answered: false, requestId: newRequestId }]
+      }
+    ]);
+
+    const first = textOfReply(await ordinaryWithRequestId(newRequestId, 'read', { paths: ['/anything'] }));
+    const second = textOfReply(await ordinaryWithRequestId(newRequestId, 'read', { paths: ['/anything'] }));
+    expect(first).toContain('WORKER_CONTEXT_LIMITED');
+    expect(second).toContain('WORKER_CONTEXT_LIMITED');
+    expect(first).toContain('Nothing was run');
+    expect(second).toContain('Nothing was run');
+    expect(swarmRunning()).toBe(false);
+    expect(silentCeilingRecoveryTurn('c-worker-1')).toBe(oldTurnId);
+  });
+
+  it('refuses agents finish from a new post-sleep turn instead of treating it as a lost finish retry', async () => {
+    startSwarm(1);
+    startWorker('worker-1');
+    const oldRequestId = 'wfr_ceiling_finish_old';
+    const oldTurnId = 't-ceiling-finish-old';
+    await recordChatObservations('c-worker-1', [
+      { kind: 'turn_start', time: Date.now(), turnId: oldTurnId },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: oldTurnId,
+        calls: [{ messageId: 'm-ceiling-finish-old', tool: 'read', order: 0, answered: false, requestId: oldRequestId }]
+      }
+    ]);
+    await ordinaryWithRequestId(oldRequestId, 'read', { paths: ['/anything'] });
+    const session = await findSessionByConversation('c-worker-1', { requireUnique: true });
+    const cutoff = await requestTurnOwnershipCutoff(session!.id, 'c-worker-1');
+    fillContext('c-worker-1');
+    sleepSilentWorkers(
+      Date.now() + WORKER_SILENCE_MS + 1,
+      undefined,
+      () => false,
+      () => oldTurnId,
+      () => cutoff
+    );
+    expect(releaseQuiescentRun()).toBe(true);
+
+    const newRequestId = 'wfr_ceiling_finish_new';
+    await recordChatObservations('c-worker-1', [
+      { kind: 'turn_start', time: Date.now() + 1, turnId: 't-ceiling-finish-new' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now() + 1,
+        turnId: 't-ceiling-finish-new',
+        calls: [{ messageId: 'm-ceiling-finish-new', tool: 'agents', order: 0, answered: false, requestId: newRequestId }]
+      }
+    ]);
+    const refused = await agentsWithRequestId(newRequestId, 'finish', { result: 'wrong turn must not finish' });
+    expect(refused).toContain('WORKER_CONTEXT_LIMITED');
+    expect(refused).toContain('Nothing was run');
+    expect(silentCeilingRecoveryTurn('c-worker-1')).toBe(oldTurnId);
+    expect(swarmStateForCaller(prime).agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'sleeping',
+      revivable: false,
+      silenceRecoveryTurnId: oldTurnId
+    });
+  });
+
+  it('accepts agents finish from the exact pre-park ceiling turn', async () => {
+    startSwarm(1);
+    startWorker('worker-1');
+    const requestId = 'wfr_ceiling_finish_same';
+    const turnId = 't-ceiling-finish-same';
+    await recordChatObservations('c-worker-1', [
+      { kind: 'turn_start', time: Date.now(), turnId },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId,
+        calls: [{ messageId: 'm-ceiling-finish-same', tool: 'read', order: 0, answered: false, requestId }]
+      }
+    ]);
+    await ordinaryWithRequestId(requestId, 'read', { paths: ['/anything'] });
+    const session = await findSessionByConversation('c-worker-1', { requireUnique: true });
+    const cutoff = await requestTurnOwnershipCutoff(session!.id, 'c-worker-1');
+    fillContext('c-worker-1');
+    sleepSilentWorkers(
+      Date.now() + WORKER_SILENCE_MS + 1,
+      undefined,
+      () => false,
+      () => turnId,
+      () => cutoff
+    );
+    expect(releaseQuiescentRun()).toBe(true);
+
+    const finished = await agentsWithRequestId(requestId, 'finish', { result: 'same old turn done' });
+    expect(finished).toMatch(/finished/i);
+    expect(finished).not.toContain('WORKER_CONTEXT_LIMITED');
+    expect(swarmStateForCaller(prime).agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'finished',
+      revivable: false,
+      silenceParked: false,
+      silenceRecoveryTurnId: null
+    });
+  });
+
   it('delivers and acknowledges a parked prime inbox by exact conversation without adopting another history', async () => {
     startSwarm(1);
     startWorker('worker-1');
 
     const finished = await asChat('c-worker-1', 'finish', { result: 'parked-prime-report' });
     expect(finished).toMatch(/reported and is now asleep/i);
+    expect(finished).toContain('This acknowledgment does not confirm delivery to the prime');
+    expect(finished).not.toContain('The prime agent has your result');
     expect(swarmRunning()).toBe(false);
+
+    const pending = () => snapshotSwarm()!.dormantRuns
+      ?.find(family => family.primeConversationId === PRIME_CHAT)
+      ?.agents.find(agent => agent.info.id === PRIME_ID)?.queue ?? [];
+    expect(pending()).toHaveLength(1);
+    expect(pending()[0]).toMatchObject({ offeredAt: null, offers: 0, ackedAt: null });
+    const retry = await asChat('c-worker-1', 'finish', { result: 'retry must not replace the original report' });
+    expect(retry).toContain('This acknowledgment does not confirm delivery to the prime');
+    expect(retry).not.toContain('already has that result');
+    expect(pending()).toHaveLength(1);
+    expect(pending()[0]).toMatchObject({ offeredAt: null, offers: 0, ackedAt: null });
+    expect(pending()[0]!.text).toContain('parked-prime-report');
+    expect(pending()[0]!.text).not.toContain('retry must not replace');
 
     // The final worker report lives in A's dormant prime queue. There is no live agent:prime
     // identity to address here, so delivery must resolve from the exact prime conversation.
@@ -3122,6 +3853,25 @@ describe('through the MCP endpoint', () => {
     expect(report?.text).not.toContain('ended without ever confirming');
   });
 
+  it('does not call a message unread when it arrived after the worker\'s last step and is still queued for it (#551)', async () => {
+    startSwarm(1);
+    bindConversation('worker-1', 'c-worker-1');
+    // Live 2.1.17 trace: the prime queued the next assignment while the worker was finishing the
+    // previous one. The report said the worker "ended without ever confirming" it, and a
+    // millisecond later the app woke the worker to deliver exactly that message.
+    sendMessage(prime, 'worker-1', 'second assignment: run the canary again');
+    await asChat('c-worker-1', 'finish', { result: 'first assignment done' });
+    const report = offerMessagesForConversation(PRIME_CHAT)?.messages.find((message) =>
+      message.text.includes('[worker-1 reported]')
+    );
+    expect(report?.text).toContain('first assignment done');
+    expect(report?.text).not.toContain('ended without ever confirming');
+    expect(report?.text).not.toContain('may not have read');
+    expect(report?.text).toContain('still queued for it');
+    // And it really is: the unread assignment waits for the worker instead of being dropped.
+    expect(swarmStateForCaller(prime).agents.find((agent) => agent.id === 'worker-1')?.pending).toBe(1);
+  });
+
   it('tells the prime how much worker capacity the report just freed, and that the worker is reusable', async () => {
     // A worker that reports is capacity coming back, and the prime is the only party that can
     // spend it. The final report used to end at the result, so "finished" read as an ending
@@ -3165,6 +3915,8 @@ describe('through the MCP endpoint', () => {
 
     const workerResult = await asChat('c-worker-1', 'finish', { result: 'all of it done' });
     expect(workerResult).toContain('reached its context limit');
+    expect(workerResult).toContain('This acknowledgment does not confirm delivery to the prime');
+    expect(workerResult).not.toContain('The prime agent has your result');
     expect(workerResult).not.toContain('remains reusable');
     const report = offerMessagesForConversation(PRIME_CHAT)?.messages.find((message) =>
       message.text.includes('[worker-1 finished]')
@@ -3358,6 +4110,130 @@ describe('through the MCP endpoint', () => {
     expect(pendingCount('worker-1')).toBe(0);
   });
 
+  it('lets existing primes exchange messages by explicit run address without exposing foreign workers', async () => {
+    const primeB: Caller = { conversationId: 'mcp-peer-prime-b' };
+    const a = spawn({ caller: prime, workers: [{ task: 'A worker' }] });
+    const b = spawn({ caller: primeB, workers: [{ task: 'B worker' }] });
+    expect(bindConversation('worker-1', 'mcp-peer-worker-a', a.runId)).toBe(true);
+
+    const sent = await structuredAsChat(PRIME_CHAT, 'message', {
+      target_run_id: b.runId,
+      text: 'B, audit the parser lane'
+    });
+    expect(sent).toMatchObject({
+      action: 'message',
+      run_id: a.runId,
+      target_run_id: b.runId,
+      queued: [{ to: PRIME_ID }]
+    });
+
+    const received = await asChat(primeB.conversationId!, 'status');
+    expect(received).toContain('B, audit the parser lane');
+    expect(received).toContain(`source_run_id=${a.runId}`);
+    expect(received).not.toContain('mcp-peer-worker-a');
+
+    const reply = await asChat(primeB.conversationId!, 'message', {
+      target_run_id: a.runId,
+      text: 'A, parser lane is covered'
+    });
+    expect(reply).toContain(b.runId);
+    const bSession = await findSessionByConversation(primeB.conversationId!);
+    const delivered = bSession
+      ? (await readRecentEvents(bSession.id, 50, { kinds: ['agent_message'] })).filter(
+          event => event.kind === 'agent_message' && event.delivery === 'delivered' && event.message.text === 'B, audit the parser lane'
+        )
+      : [];
+    expect(delivered).toEqual([expect.objectContaining({ fromRunId: a.runId })]);
+    const returned = await asChat(PRIME_CHAT, 'status');
+    expect(returned).toContain('A, parser lane is covered');
+    expect(returned).toContain(`source_run_id=${b.runId}`);
+
+    const refused = await asChat('mcp-peer-worker-a', 'message', {
+      target_run_id: b.runId,
+      text: 'worker bypass'
+    });
+    expect(refused).toMatch(/only a prime/i);
+
+    const foreignWorker = await asChat(PRIME_CHAT, 'message', {
+      target_run_id: b.runId,
+      to: 'worker-1',
+      text: 'reach through to B worker'
+    });
+    expect(foreignWorker).toMatch(/destination prime/i);
+  });
+
+  it('rolls back a cross-prime message on a failed durable write and accepts exactly one retry', async () => {
+    const peer = { conversationId: 'mcp-peer-durability' };
+    spawn({ caller: prime, workers: [{ task: 'A worker' }] });
+    const b = spawn({ caller: peer, workers: [{ task: 'B worker' }] });
+    onSwarmPersistNow(async () => { throw new Error('injected peer write failure'); });
+
+    const failed = await asChat(PRIME_CHAT, 'message', { target_run_id: b.runId, text: 'audit parser' });
+    expect(failed).toContain('Nothing was queued; retry the same message request. (injected peer write failure)');
+    expect(offerMessagesForConversation(peer.conversationId)?.messages).toEqual([]);
+    expect(snapshotSwarm()?.activeRuns?.find(run => run.runId === b.runId)
+      ?.agents.find(agent => agent.info.id === PRIME_ID)?.queue).toEqual([]);
+
+    onSwarmPersistNow(async () => undefined);
+    const retried = await asChat(PRIME_CHAT, 'message', { target_run_id: b.runId, text: 'audit parser' });
+    expect(retried).toContain(`Queued for prime family ${b.runId}`);
+    expect(offerMessagesForConversation(peer.conversationId)?.messages.map(message => message.text)).toEqual(['audit parser']);
+  });
+
+  it('refuses a cross-prime message if its destination disappears during the durable write', async () => {
+    spawn({ caller: prime, workers: [{ task: 'A worker' }] });
+    const b = spawn({ caller: { conversationId: 'mcp-peer-retired' }, workers: [{ task: 'B worker' }] });
+    onSwarmPersistNow(async () => { clearAgent(PRIME_ID, b.runId); });
+
+    const failed = await asChat(PRIME_CHAT, 'message', { target_run_id: b.runId, text: 'late handoff' });
+    expect(failed).toContain('TARGET_RUN_UNAVAILABLE: the destination prime family changed before acceptance. Nothing was queued.');
+    expect(currentRunId('mcp-peer-retired')).toBeNull();
+    expect(swarmStateForCaller(prime).agents.find(agent => agent.id === PRIME_ID)?.pending).toBe(0);
+  });
+
+  it('keeps an unacknowledged cross-prime reply address valid across more than eight source incarnations', async () => {
+    const primeB: Caller = { conversationId: 'mcp-peer-reply-prime-b' };
+    const a = spawn({ caller: prime, workers: [{ task: 'A worker' }] });
+    const b = spawn({ caller: primeB, workers: [{ task: 'B worker' }] });
+    expect(bindConversation('worker-1', 'mcp-peer-reply-worker-a', a.runId)).toBe(true);
+
+    const sent = await asChat(PRIME_CHAT, 'message', {
+      target_run_id: b.runId,
+      text: 'B, hold this reply route while A sleeps'
+    });
+    expect(sent).toContain(`target_run_id=${a.runId}`);
+
+    // B has seen A's source_run_id, but has not made the next authenticated call that ACKs
+    // this result yet. A can legitimately sleep and wake repeatedly in the meantime.
+    const received = await asChat(primeB.conversationId!, 'status');
+    expect(received).toContain(`source_run_id=${a.runId}`);
+    finishAgent({ conversationId: 'mcp-peer-reply-worker-a' }, 'A sleeps');
+    expect(releaseQuiescentRun({}, a.runId)).toBe(true);
+
+    let currentA = a.runId;
+    for (let incarnation = 0; incarnation < 12; incarnation += 1) {
+      expect(reactivateDormantRunForConversation('mcp-peer-reply-worker-a')).toBe(true);
+      const nextA = currentRunId(PRIME_CHAT)!;
+      expect(nextA).not.toBe(currentA);
+      expect(releaseQuiescentRun({}, nextA)).toBe(true);
+      currentA = nextA;
+    }
+    const parkedA = snapshotSwarm()!.dormantRuns!.find(run => run.primeConversationId === PRIME_CHAT)!;
+    expect(parkedA.formerRunIds).toHaveLength(9);
+    expect(parkedA.formerRunIds?.[0]).toBe(a.runId);
+
+    // This is B's next authenticated call, so the kernel ACKs the previously offered row before
+    // dispatching the reply. The source_run_id printed in that row must still be a valid address.
+    const reply = await asChat(primeB.conversationId!, 'message', {
+      target_run_id: a.runId,
+      text: 'A, the delayed peer reply still routes'
+    });
+    expect(reply).toContain('Queued for prime family');
+
+    const returned = await asChat(PRIME_CHAT, 'status');
+    expect(returned).toContain('A, the delayed peer reply still routes');
+  });
+
   it('carries the run and every agent in machine-readable form beside the prose', async () => {
     startSwarm(1);
     bindConversation('worker-1', 'c-worker-1');
@@ -3371,10 +4247,180 @@ describe('through the MCP endpoint', () => {
   });
 });
 
+/**
+ * The worker wait a Goal/Loop chat opts into, as the one module that owns worker state.
+ *
+ * A prime that delegated half its task is not finished with it: its workers report back into
+ * the same conversation, so deciding the next step while they run reads a context that is about
+ * to change. The predicate is the whole rule — the bridge's pickup tree and the finish tool both
+ * ask this same function — so what is asserted here is the boundary itself: opt-in, per family,
+ * and fail-open on every state that is not "this chat's workers are working".
+ */
+describe('waiting for a chat own sub-agents', () => {
+  /** The production shape: the setting saved beside the rest of the multi-agent config. */
+  async function setWaitForSubAgents(on: boolean, maxWorkers = 3): Promise<void> {
+    const base = defaultConfig();
+    await saveConfig({
+      ...base,
+      multiAgent: { ...base.multiAgent, enabled: true, maxWorkers, waitForSubAgents: on }
+    });
+  }
+
+  afterEach(async () => { await setEnabled(true); });
+
+  it('holds only while a worker of this chat is occupying a slot, and releases on its report', async () => {
+    await setWaitForSubAgents(true);
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(false);
+    startSwarm(1);
+    // Invited and bound alike: a spawn in progress is work this chat started.
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(true);
+    const worker = startWorker('worker-1');
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(true);
+    finishAgent(worker.caller, 'the piece I was given is done');
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(false);
+    // A sleeping worker is revivable, which is not the same as working.
+    expect(freeWorkerSlots()).toBe(3);
+  });
+
+  it('is opt-in: a busy worker holds nothing while the setting is off', async () => {
+    await setWaitForSubAgents(false);
+    startSwarm(1);
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(false);
+    await setWaitForSubAgents(true);
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(true);
+  });
+
+  it.each([
+    ['an unknown conversation', 'c-never-seen'],
+    ['no conversation at all', null],
+    ['an empty conversation id', '']
+  ] as const)('fails open for %s', async (_label, conversationId) => {
+    await setWaitForSubAgents(true);
+    startSwarm(1);
+    expect(waitingForSubAgents(conversationId)).toBe(false);
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(true);
+  });
+
+  it('fails open for a chat with a run but no workers left', async () => {
+    await setWaitForSubAgents(true);
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'done');
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(false);
+    // A chat that owns nothing and merely shares this app's single run: the run's workers are
+    // the prime's, and this chat is not the prime.
+    expect(waitingForSubAgents('c-a-bystander')).toBe(false);
+  });
+
+  it('holds each prime for its own workers and never for another family', async () => {
+    await setWaitForSubAgents(true);
+    const primeB: Caller = { conversationId: 'wait-prime-b' };
+    const a = spawn({ caller: prime, workers: [{ task: 'A work' }] });
+    const b = spawn({ caller: primeB, workers: [{ task: 'B work' }] });
+    expect(a.runId).not.toBe(b.runId);
+    expect(bindConversation('worker-1', 'wait-worker-a', a.runId)).toBe(true);
+    expect(bindConversation('worker-1', 'wait-worker-b', b.runId)).toBe(true);
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(true);
+    expect(waitingForSubAgents(primeB.conversationId!)).toBe(true);
+    finishAgent({ conversationId: 'wait-worker-a' }, 'A done');
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(false);
+    expect(waitingForSubAgents(primeB.conversationId!)).toBe(true);
+  });
+
+  it('does not hold a chat the workers belong to an ended run', async () => {
+    await setWaitForSubAgents(true);
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'done');
+    expect(releaseQuiescentRun()).toBe(true);
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(false);
+    expect(waitingForSubAgents('c-worker-1')).toBe(false);
+  });
+});
+
 describe('simultaneous independent prime families', () => {
   const primeB: Caller = { conversationId: 'parallel-prime-b' };
   const recruit = (caller: Caller, count = 2) => spawn({ caller,
     workers: Array.from({ length: count }, (_, i) => ({ task: `parallel task ${i}` })) });
+
+  it('enforces one optional admission cap across independent prime families', async () => {
+    await setEnabled(true, 2, false, 3);
+    try {
+      const a = recruit(prime, 2);
+      const b = recruit(primeB, 1);
+      expect(a.runId).not.toBe(b.runId);
+      // B still has room under its own per-family limit. The refusal comes only from the
+      // separately configured global admission cap shared by all prime families.
+      expect(freeWorkerSlots(b.runId)).toBe(1);
+      const nextB = () => spawn({ caller: primeB, workers: [{ task: 'B second global task' }] });
+      expect(nextB).toThrow(/GLOBAL_WORKER_LIMIT|global worker/i);
+
+      expect(bindConversation('worker-1', 'parallel-global-worker-a', a.runId)).toBe(true);
+      finishAgent({ conversationId: 'parallel-global-worker-a' }, 'A freed one global slot');
+      expect(nextB().runId).toBe(b.runId);
+    } finally {
+      await setEnabled(true);
+    }
+  });
+
+  it('counts an unpublished staged spawn as a global admission reservation', async () => {
+    await setEnabled(true, 2, false, 1);
+    try {
+      const a = stageSpawn({ caller: prime, workers: [{ task: 'A staged reservation' }] });
+      expect(() => stageSpawn({ caller: primeB, workers: [{ task: 'B cannot overbook it' }] }))
+        .toThrow(/GLOBAL_WORKER_LIMIT|global worker/i);
+      a.rollback();
+      const b = stageSpawn({ caller: primeB, workers: [{ task: 'B after rollback' }] });
+      b.rollback();
+    } finally {
+      await setEnabled(true);
+    }
+  });
+
+  it('uses the same global admission cap when another family wakes a sleeping worker', async () => {
+    await setEnabled(true, 2, false, 1);
+    try {
+      const a = recruit(prime, 1);
+      expect(bindConversation('worker-1', 'parallel-global-sleeper-a', a.runId)).toBe(true);
+      finishAgent({ conversationId: 'parallel-global-sleeper-a' }, 'A sleeps');
+      expect(releaseQuiescentRun({}, a.runId)).toBe(true);
+
+      const b = recruit(primeB, 1);
+      expect(() => stageMessages(prime, [{ to: 'worker-1', text: 'wake A while B owns the global slot' }]))
+        .toThrow(/GLOBAL_WORKER_LIMIT|global worker/i);
+      expect(currentRunId(PRIME_CHAT)).toBeNull();
+
+      expect(bindConversation('worker-1', 'parallel-global-worker-b', b.runId)).toBe(true);
+      finishAgent({ conversationId: 'parallel-global-worker-b' }, 'B frees the global slot');
+      const wake = stageMessages(prime, [{ to: 'worker-1', text: 'wake A after B stops' }]);
+      expect(wake.waking).toEqual(['worker-1']);
+      wake.rollback();
+    } finally {
+      await setEnabled(true);
+    }
+  });
+
+  it('does not auto-revive queued worker work past the global admission cap', async () => {
+    await setEnabled(true, 2, false, 1);
+    try {
+      const a = recruit(prime, 1);
+      expect(bindConversation('worker-1', 'parallel-global-queued-a', a.runId)).toBe(true);
+      sendMessage(prime, 'worker-1', 'queued work for A');
+      finishAgent({ conversationId: 'parallel-global-queued-a' }, 'A pauses before queued work');
+
+      const b = recruit(primeB, 1);
+      expect(stageQueuedWorkerRevivals(['worker-1'], a.runId).waking).toEqual([]);
+      expect(statusForCaller(prime).state.agents.find(agent => agent.id === 'worker-1')?.state).toBe('sleeping');
+
+      expect(bindConversation('worker-1', 'parallel-global-queued-b', b.runId)).toBe(true);
+      finishAgent({ conversationId: 'parallel-global-queued-b' }, 'B frees the global slot');
+      const wake = stageQueuedWorkerRevivals(['worker-1'], a.runId);
+      expect(wake.waking).toEqual(['worker-1']);
+      wake.rollback();
+    } finally {
+      await setEnabled(true);
+    }
+  });
 
   it('admits two workers for each of two primes and refuses only the full owner', async () => {
     await setEnabled(true, 2);
@@ -3414,6 +4460,131 @@ describe('simultaneous independent prime families', () => {
     expect(offerMessagesForConversation(PRIME_CHAT)?.messages.map(m => m.text).join('')).toContain('A-only result');
     expect(offerMessagesForConversation(primeB.conversationId)?.messages).toEqual([]);
     expect(() => recruit({ conversationId: 'parallel-worker-b' }, 1)).toThrow(/worker/i);
+  });
+
+  it('routes an explicit prime-to-prime message durably and preserves its reply address across restart', () => {
+    const a = recruit(prime, 1), b = recruit(primeB, 1);
+    const staged = stagePrimeMessage({ ...prime, runId: a.runId }, b.runId, 'coordinate with B');
+    expect(staged).toMatchObject({ sourceRunId: a.runId, targetRunId: b.runId });
+    expect(staged.message).toMatchObject({
+      from: PRIME_ID,
+      to: PRIME_ID,
+      fromRunId: a.runId,
+      text: 'coordinate with B'
+    });
+    // Staged rows are invisible until the same durable barrier used by ordinary agent messages
+    // accepts them.
+    expect(offerMessagesForConversation(primeB.conversationId)?.messages).toEqual([]);
+    expect(staged.commit()).toBe(true);
+
+    const snapshot = JSON.parse(JSON.stringify(snapshotSwarm()));
+    resetAgentsForTests();
+    restoreSwarm(snapshot);
+    const received = offerMessagesForConversation(primeB.conversationId)?.messages;
+    expect(received).toEqual([
+      expect.objectContaining({
+        from: PRIME_ID,
+        to: PRIME_ID,
+        fromRunId: a.runId,
+        text: 'coordinate with B'
+      })
+    ]);
+    expect(statusForCaller(prime).state.agents.map(agent => agent.runId)).toEqual([a.runId, a.runId]);
+    expect(statusForCaller(primeB).state.agents.map(agent => agent.runId)).toEqual([b.runId, b.runId]);
+  });
+
+  it('keeps the peer reply alias bounded and restorable after more than eight source incarnations', () => {
+    const a = recruit(prime, 1), b = recruit(primeB, 1);
+    expect(bindConversation('worker-1', 'parallel-peer-reply-worker-a', a.runId)).toBe(true);
+    const staged = stagePrimeMessage({ ...prime, runId: a.runId }, b.runId, 'B keeps A reply address');
+    expect(staged.commit()).toBe(true);
+    expect(offerMessagesForConversation(primeB.conversationId)?.messages).toEqual([
+      expect.objectContaining({ fromRunId: a.runId, text: 'B keeps A reply address' })
+    ]);
+
+    finishAgent({ conversationId: 'parallel-peer-reply-worker-a' }, 'A sleeps');
+    expect(releaseQuiescentRun({}, a.runId)).toBe(true);
+    for (let incarnation = 0; incarnation < 12; incarnation += 1) {
+      expect(reactivateDormantRunForConversation('parallel-peer-reply-worker-a')).toBe(true);
+      const nextA = currentRunId(PRIME_CHAT)!;
+      expect(releaseQuiescentRun({}, nextA)).toBe(true);
+    }
+
+    const laterMessage = stagePrimeMessage(
+      { ...prime, runId: a.runId },
+      b.runId,
+      'A still publishes the same peer reply address'
+    );
+    expect(laterMessage.sourceRunId).toBe(a.runId);
+    laterMessage.rollback();
+
+    const beforeRestart = snapshotSwarm()!;
+    const parkedBefore = beforeRestart.dormantRuns!.find(run => run.primeConversationId === PRIME_CHAT)!;
+    expect(parkedBefore.formerRunIds).toHaveLength(9);
+    expect(parkedBefore.formerRunIds?.[0]).toBe(a.runId);
+
+    resetAgentsForTests();
+    restoreSwarm(JSON.parse(JSON.stringify(beforeRestart)));
+    const parkedAfter = snapshotSwarm()!.dormantRuns!.find(run => run.primeConversationId === PRIME_CHAT)!;
+    expect(parkedAfter.formerRunIds).toHaveLength(9);
+    expect(parkedAfter.formerRunIds?.[0]).toBe(a.runId);
+
+    const reply = stagePrimeMessage({ ...primeB, runId: b.runId }, a.runId, 'A receives reply after restore');
+    expect(reply.targetRunId).toBe(parkedAfter.agents.find(agent => agent.info.id === PRIME_ID)!.info.runId);
+    expect(reply.commit()).toBe(true);
+    expect(offerMessagesForConversation(PRIME_CHAT)?.messages.map(message => message.text)).toContain(
+      'A receives reply after restore'
+    );
+  });
+
+  it('keeps a cross-prime row unpublished until its critical snapshot is durable', async () => {
+    const a = recruit(prime, 1), b = recruit(primeB, 1);
+    const staged = stagePrimeMessage({ ...prime, runId: a.runId }, b.runId, 'durable peer handoff');
+    const publicBefore = snapshotSwarm()?.activeRuns
+      ?.find(run => run.runId === b.runId)?.agents
+      .find(agent => agent.info.id === PRIME_ID)?.queue ?? [];
+    expect(publicBefore).toEqual([]);
+
+    const writes: Array<ReturnType<typeof snapshotSwarm>> = [];
+    onSwarmPersistNow(async snapshot => {
+      writes.push(structuredClone(snapshot));
+    });
+    expect(await persistCriticalSwarmNow()).toBe(true);
+    const durableQueue = writes.at(-1)?.activeRuns
+      ?.find(run => run.runId === b.runId)?.agents
+      .find(agent => agent.info.id === PRIME_ID)?.queue ?? [];
+    expect(durableQueue).toEqual([
+      expect.objectContaining({ text: 'durable peer handoff', fromRunId: a.runId })
+    ]);
+
+    expect(staged.commit()).toBe(true);
+    const publicAfter = snapshotSwarm()?.activeRuns
+      ?.find(run => run.runId === b.runId)?.agents
+      .find(agent => agent.info.id === PRIME_ID)?.queue ?? [];
+    expect(publicAfter).toEqual([
+      expect.objectContaining({ text: 'durable peer handoff', fromRunId: a.runId })
+    ]);
+  });
+
+  it('keeps the foreign-family boundary closed around the prime-to-prime address', () => {
+    const a = recruit(prime, 1), b = recruit(primeB, 1);
+    expect(bindConversation('worker-1', 'parallel-peer-worker-a', a.runId)).toBe(true);
+
+    expect(() =>
+      stagePrimeMessage({ conversationId: 'parallel-peer-worker-a', runId: a.runId }, b.runId, 'bypass')
+    ).toThrow(/only a prime/i);
+    expect(() =>
+      stagePrimeMessage({ ...prime, runId: a.runId }, a.runId, 'talk to myself')
+    ).toThrow(/own families/i);
+    expect(() =>
+      stagePrimeMessage({ ...prime, runId: a.runId }, '00000000-0000-4000-8000-000000000000', 'guess')
+    ).toThrow(/TARGET_RUN_UNAVAILABLE/);
+
+    // Existing family-local commands keep their ownership rule even though the caller knows B's
+    // run id. The new address is a message endpoint for B's prime, not a capability for B's rows.
+    expect(() =>
+      stageMessages({ ...prime, runId: b.runId }, [{ to: 'worker-1', text: 'foreign worker' }])
+    ).toThrow(/AGENTS_BUSY/);
   });
 
   it('allows independent staged spawns while rollback cannot erase another accepted owner', async () => {
@@ -3471,6 +4642,43 @@ describe('simultaneous independent prime families', () => {
     expect(statusForCaller(primeB).state.agents.find(a => a.id === 'worker-1')?.state).toBe('active');
   });
 
+  it('keeps a woken family selectable by the run_id its prime was given before it parked (#881, #882)', () => {
+    // Every report a worker sends the prime is labelled with the run_id of that moment. Once all
+    // workers slept, the family parked; the prime's next message woke it under a new id, and its
+    // reply with the id it had just been given was refused as "no agent family belongs to this
+    // conversation" (2.1.24 log in #882: three refusals right after each reactivation).
+    const a = recruit(prime, 1), b = recruit(primeB, 1);
+    bindConversation('worker-1', 'parallel-worker-a', a.runId);
+    bindConversation('worker-1', 'parallel-worker-b', b.runId);
+    finishAgent({ conversationId: 'parallel-worker-a' }, 'A sleeps');
+    expect(releaseQuiescentRun({}, a.runId)).toBe(true);
+    stageMessages({ ...prime, runId: a.runId }, [{ to: 'worker-1', text: 'reuse A' }]).commit();
+    const nextA = currentRunId(PRIME_CHAT)!;
+    expect(nextA).not.toBe(a.runId);
+
+    // The browser fence stays exact: only the new incarnation may claim the wake.
+    expect(claimWorkerRevival('worker-1', 'parallel-worker-a', a.runId)).toBe(false);
+    expect(claimWorkerRevival('worker-1', 'parallel-worker-a', nextA)).toBe(true);
+    expect(noteWorkerRevived('worker-1', 'parallel-worker-a', pendingWorkerRevivals()[0]!.messageIds, null, nextA)).toBe(true);
+    expect(noteAgentAlive('parallel-worker-a', 'call')?.revived).toBe(true);
+
+    // The prime's earlier id still selects its own, now woken family.
+    expect(statusForCaller({ ...prime, runId: a.runId })).toMatchObject({ runId: nextA });
+    const before = pendingCount('worker-1', nextA);
+    stageMessages({ ...prime, runId: a.runId }, [{ to: 'worker-1', text: 'follow-up with the id from the report' }]).commit();
+    expect(pendingCount('worker-1', nextA)).toBe(before + 1);
+
+    // It never selects another prime's family, and never moves the browser fence back.
+    expect(() => statusForCaller({ ...primeB, runId: a.runId })).toThrow(/AGENTS_BUSY/);
+    expect(() => stageMessages({ ...primeB, runId: a.runId }, [{ to: 'worker-1', text: 'not yours' }])).toThrow(/AGENTS_BUSY/);
+    expect(pendingCount('worker-1', b.runId)).toBe(0);
+
+    // And it survives a restart, like the family it names.
+    const snapshot = JSON.parse(JSON.stringify(snapshotSwarm()));
+    resetAgentsForTests(); restoreSwarm(snapshot);
+    expect(statusForCaller({ ...prime, runId: a.runId })).toMatchObject({ runId: nextA });
+  });
+
   it('fences overlapping prime transfers and preserves B when A resumes', async () => {
     const { beginPrimeTransfer, freezePrimeTransfer, commitPrimeTransfer, cancelPrimeTransfer } = await import('../src/main/agents.js');
     const a = recruit(prime, 1), b = recruit(primeB, 1);
@@ -3503,5 +4711,19 @@ describe('simultaneous independent prime families', () => {
     staged.commit();
     expect(offerMessagesForConversation(PRIME_CHAT)?.messages.map(m => m.text).join('')).toContain('A durable report');
     expect(offerMessagesForConversation(primeB.conversationId)?.messages).toEqual([]);
+  });
+});
+
+describe('one ChatGPT account on several computers', () => {
+  it('names this computer\'s Core when it refuses a call for a run it does not have', async () => {
+    // Seen live (2026-10-04): a Windows worker reported through the Mac's Core, which answered only
+    // "No sub-agent run is active". Naming the connector lets the model see it called the wrong one.
+    const stranger: Caller = { conversationId: 'a-chat-of-another-computer' };
+    expect(() => sendMessage(stranger, PRIME_ID, 'done')).toThrow('No sub-agent run is active in Chat On Steroids Core. ');
+    const previous = getConfig();
+    await saveConfig({ ...previous, connectorSuffix: 'Windows' });
+    try {
+      expect(() => sendMessage(stranger, PRIME_ID, 'done')).toThrow('No sub-agent run is active in Chat On Steroids Core (Windows). ');
+    } finally { await saveConfig(previous); }
   });
 });

@@ -8,13 +8,14 @@
  * brief.
  */
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Handoff } from '../../shared/session.js';
 import { continuationMarkerOf, unescapeMarkdown } from '../../shared/session.js';
 import { logInfo } from '../logger.js';
 import { getSession, readSessionPlan, saveHandoff } from './store.js';
 import { destinationContinuationMarker } from './handoff-prompt.js';
-import { userPromptText } from '../../shared/user-prompt.js';
+import { MAX_CHATGPT_MESSAGE_CHARS, userPromptText } from '../../shared/user-prompt.js';
+import type { AgentPlan } from '../../shared/agent-plan.js';
 
 export interface PrepareHandoffInput {
   sessionId: string;
@@ -24,10 +25,45 @@ export interface PrepareHandoffInput {
   /** How the recording looked when the brief was written. Defaults to the session's own counts. */
   sourceEvents?: number;
   sourceTokens?: number;
+  /** Reserve the exact replacement message's framing before persisting its brief. */
+  continuationToken?: string;
+  /** Exact frontend/turn that authored this continuation brief. */
+  sourceConversationId?: string | null;
+  sourceTurnId?: string | null;
 }
 
-export function handoffPlanNotice(sessionId: string): string {
-  return `\n\nA task plan exists. Check the latest update_plan call with session(action="read", session_id="${sessionId}", include=["tools"]); expand its tool_call reference for the steps and statuses before continuing.`;
+/** A public, non-authority id for provenance. The raw continuation token is never persisted here. */
+export function handoffContinuationId(token: string | null | undefined): string | null {
+  if (!token || !/^[A-Za-z0-9_-]{16,64}$/.test(token)) return null;
+  return createHash('sha256').update(token, 'utf8').digest('base64url');
+}
+
+/**
+ * New handoffs prove which continuation created them. Legacy handoffs have no such proof and
+ * remain readable for compatibility; callers must rely on the older transaction evidence.
+ */
+export function handoffMatchesContinuation(
+  handoff: Handoff,
+  token: string,
+  sourceConversationId: string,
+  sourceTurnId: string | null
+): boolean {
+  if (handoff.version === undefined && handoff.provenance === undefined) return true;
+  if (handoff.version !== 1 || !handoff.provenance) return false;
+  const continuationId = handoffContinuationId(token);
+  return !!continuationId &&
+    handoff.provenance?.continuationId === continuationId &&
+    handoff.provenance.sourceConversationId === sourceConversationId &&
+    handoff.provenance.sourceTurnId === sourceTurnId;
+}
+
+function handoffPlanNotice(plan: AgentPlan | null): string {
+  if (!plan?.plan.length) return '';
+  const steps = plan.plan.map((step, index) =>
+    `${index + 1}. [${step.status}] ${step.step}${step.details ? `\n${step.details}` : ''}`).join('\n');
+  return '\n\nSaved task plan at handoff (reported progress, not verification evidence):\n' +
+    (plan.explanation ? `${plan.explanation}\n` : '') + steps +
+    '\nContinue the unfinished work using this plan and the brief. Report progress with update_plan.';
 }
 
 /**
@@ -46,6 +82,20 @@ export function resumeBootstrapText(summary: string, token = ''): string {
     'its own work; carry on from it rather than starting again.\n\n' +
     summary
   );
+}
+
+/** Keep TASK and NEXT / DO NOT when a brief exceeds the replacement message budget. */
+function boundBrief(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const marker = '\n\n[… the middle of this brief was longer than the app carries across and was left out …]\n\n';
+  const room = maxChars - marker.length;
+  const headRoom = Math.floor(room * 0.4);
+  const head = text.slice(0, headRoom);
+  const tail = text.slice(text.length - (room - headRoom));
+  const headBreak = head.lastIndexOf('\n');
+  const tailBreak = tail.indexOf('\n');
+  return (headBreak > headRoom - 400 ? head.slice(0, headBreak) : head) + marker +
+    (tailBreak >= 0 && tailBreak < 400 ? tail.slice(tailBreak + 1) : tail);
 }
 
 /**
@@ -131,19 +181,26 @@ export function newHandoffId(now: Date = new Date()): string {
  * its semantic state is durable; restart recovery repairs the tiny opposite crash window.
  */
 export async function prepareHandoff(input: PrepareHandoffInput): Promise<Handoff> {
-  const text = input.text.trim();
+  let text = input.text.trim();
   if (!text) throw new Error('A handoff cannot be empty');
   const summary = await getSession(input.sessionId);
   if (!summary) throw new Error('That session no longer exists');
+  // Freeze the actual saved plan with the brief. A pointer to the removed session
+  // tool cannot supply it to the replacement model. Budget this same snapshot once.
+  const planNotice = handoffPlanNotice(await readSessionPlan(input.sessionId));
+  const overhead = resumeBootstrapText('', input.continuationToken).length + planNotice.length;
+  text = boundBrief(text, MAX_CHATGPT_MESSAGE_CHARS - overhead);
   // Checked again here, and not only at the bridge route that can word the refusal well,
   // because this is the one function that writes a handoff to disk. A stub that reaches the
   // store is indistinguishable from a real brief for the rest of its life.
   const shortfall = briefShortfall(text, input.sourceTokens ?? summary.estimatedTokens);
   if (shortfall) throw new Error(shortfall);
-  const plan = await readSessionPlan(input.sessionId);
-  // Persist the notice with the brief so delivery and exact bootstrap matching agree.
-  const planNotice = plan?.plan.length ? handoffPlanNotice(input.sessionId) : '';
+  const sourceConversationId = input.sourceConversationId === undefined
+    ? summary.conversationId
+    : input.sourceConversationId;
+  const sourceIndex = sourceConversationId ? summary.chatIds.indexOf(sourceConversationId) : -1;
   const handoff: Handoff = {
+    version: 1,
     id: newHandoffId(),
     sessionId: input.sessionId,
     createdAt: Date.now(),
@@ -153,7 +210,13 @@ export async function prepareHandoff(input: PrepareHandoffInput): Promise<Handof
     // The working folder is deliberately not here. It belongs to the durable local session
     // and moves with the session's rebind (see `moveChatWorkspace`), so writing it into the
     // brief as well would be a second, weaker copy of state the commit already carries.
-    notes: [...(input.notes ?? [])]
+    notes: [...(input.notes ?? [])],
+    provenance: {
+      sourceConversationId,
+      sourceGeneration: sourceIndex >= 0 ? sourceIndex + 1 : null,
+      sourceTurnId: input.sourceTurnId ?? null,
+      continuationId: handoffContinuationId(input.continuationToken)
+    }
   };
   await saveHandoff(handoff);
   logInfo(`handoff ${handoff.id} prepared (${handoff.text.length} characters)`);

@@ -23,13 +23,13 @@ vi.mock('electron', () => ({
     decryptStringAsync: async (data: Buffer) => ({ result: data.toString(), shouldReEncrypt: false })
   }
 }));
-vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd() }));
+vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd(), shippedExtensionBuild: () => null, extensionUpdateOffer: () => null, prepareExtensionUpdate: () => null }));
 vi.mock('../src/main/connection.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/main/connection.js')>();
   return { ...actual, connect: async () => {}, getStatus: () => ({ ...actual.getStatus(), state: 'connected' }) };
 });
 vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: async () => 'chrome.exe', isPreferredBrowserRunning: async () => null }));
-const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
+const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath } = await import('../src/main/secrets.js');
 const { initDurableStore, flushDurable, resetDurableForTests, writeDurableNow } = await import('../src/main/durable.js');
 const { createSession, getSession, rebindSession, initSessionStore, resetSessionStoreForTests } = await import('../src/main/session/store.js');
@@ -128,7 +128,177 @@ it('keeps automatic Continue attached to the native question after injected corr
   } finally { clock.mockRestore(); }
 });
 
-it.each([false, true])('retires Goal only when queued input commits its exact source, including restored aliases (%s)', async alias => {
+/**
+ * The reason a recovery message could not be sent, kept instead of dropped.
+ *
+ * A Continue that was never authorized is still owed, so `releaseRecoveryClaim` hands the ticket back
+ * to the queue on purpose and keeps its pickup budget. What went with it was the explanation: the page
+ * tells the app exactly why it could not send, `failBrowserInput` receives that string, and this one
+ * branch was the only one that discarded it — every other branch there stores it as `error`.
+ *
+ * Measured on 2026-09-26: one recovery row claimed twelve times in three minutes, back to `queued`
+ * every time, with no `error` on the receipt and not a single line in the log. The loop was visible
+ * only because the *claims* are logged; the reason for the release was nowhere.
+ */
+it('keeps the reason a recovery claim was released, and says it once', async () => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const bridge = await import('../src/main/bridge.js');
+    const { getLog } = await import('../src/main/logger.js');
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false } });
+    const conversationId = randomUUID(), turnId = randomUUID(), questionId = randomUUID();
+    const session = await createSession({ title: 'Released recovery claim', conversationId });
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'user_message', messageId: questionId, text: 'Finish the task', time: now },
+      { kind: 'turn_start', turnId, time: now }
+    ] });
+    await attributedMcp(conversationId);
+    now += 120_000;
+    await bridge.sweepStaleSwarm(now);
+    const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs
+      .find((item: any) => item.conversationId === conversationId);
+    expect(repair?.reason, 'no silence repair, so no recovery row to release').toBe('silence');
+    expect((await post('/repairs/claim', { token: repair.token })).body.allowed).toBe(true);
+    await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+    const row = (await input.listInputs()).find(item => item.sessionId === session.id && item.recovery)!;
+    expect(row, 'no recovery row was filed').toBeTruthy();
+
+    expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+    const reason = 'The composer refused the prepared text.';
+    expect(await input.failBrowserInput(row.id, 'a-document', reason)).toBe(true);
+
+    // The ticket survives — that is the point of releasing rather than failing it — and now it
+    // carries why it came back.
+    const released = (await input.listInputs()).find(item => item.id === row.id)!;
+    expect(released.state, 'the ticket was not handed back to the queue').toBe('queued');
+    expect(released.owner).toBeNull();
+    expect(released.error, 'the reason the browser gave was discarded').toBe(reason);
+
+    const said = getLog().filter(entry => entry.message.includes('could not send this recovery message'));
+    expect(said, 'the release was not reported at all').toHaveLength(1);
+    expect(said[0]!.message).toContain(reason);
+
+    // Said once per reason, not once per attempt: the schedule re-offers the same ticket in seconds.
+    expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+    expect(await input.failBrowserInput(row.id, 'a-document', reason)).toBe(true);
+    expect(getLog().filter(entry => entry.message.includes('could not send this recovery message')),
+      'it repeated itself once per attempt').toHaveLength(1);
+
+    // A different reason is new information and is said.
+    expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+    expect(await input.failBrowserInput(row.id, 'a-document', 'The tab moved to another chat.')).toBe(true);
+    expect(getLog().filter(entry => entry.message.includes('could not send this recovery message'))).toHaveLength(2);
+  } finally { clock.mockRestore(); }
+});
+
+it('says why a page withdrew a Continue and ends it after three minutes of withdrawals (#820)', async () => {
+  // Measured in #820: a page released the same automatic Continue about once a second for many
+  // minutes, its text left in the composer, and the log never said why after the first time.
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const bridge = await import('../src/main/bridge.js');
+    const { getLog } = await import('../src/main/logger.js');
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false } });
+    const conversationId = randomUUID(), turnId = randomUUID(), questionId = randomUUID();
+    const session = await createSession({ title: 'Withdrawn recovery claim', conversationId });
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'user_message', messageId: questionId, text: 'Finish the task', time: now },
+      { kind: 'turn_start', turnId, time: now }
+    ] });
+    await attributedMcp(conversationId);
+    now += 120_000;
+    await bridge.sweepStaleSwarm(now);
+    const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs
+      .find((item: any) => item.conversationId === conversationId);
+    expect((await post('/repairs/claim', { token: repair.token })).body.allowed).toBe(true);
+    await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+    const row = (await input.listInputs()).find(item => item.sessionId === session.id && item.recovery)!;
+    const withdrawn = 'After-turn pickup was withdrawn before Send.';
+
+    // Through the bridge route, as the extension reports it: the reason travels with the release.
+    expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+    expect((await post('/input/fail', { id: row.id, owner: 'a-document', conversationId, error: withdrawn, detail: 'send-not-ready' })).body.ok).toBe(true);
+    expect(getLog().filter(entry => entry.message.includes('could not send this recovery message')).at(-1)?.message)
+      .toContain('(send-not-ready)');
+    const firstRelease = now;
+    expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ state: 'queued',
+      recovery: { withdrawnSince: firstRelease } });
+
+    // Repeated withdrawals inside the window keep handing the ticket back, from the same start.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      now += 30_000;
+      expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+      expect(await input.failBrowserInput(row.id, 'a-document', withdrawn, 'page-unreadable')).toBe(true);
+      expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ state: 'queued',
+        recovery: { withdrawnSince: firstRelease } });
+    }
+    // Past three minutes of nothing but withdrawals the Continue ends, and the log says why.
+    now = firstRelease + input.RECOVERY_WITHDRAW_LIMIT_MS;
+    expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+    expect(await input.failBrowserInput(row.id, 'a-document', withdrawn, 'page-unreadable')).toBe(true);
+    expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ state: 'failed',
+      error: 'Automatic Continue was not sent: page-unreadable' });
+    expect(getLog().some(entry => entry.message.includes('automatic Continue ended') && entry.message.includes('page-unreadable'))).toBe(true);
+    input.resetInputForTests();
+    expect((await input.pendingBrowserInputs()).filter(item => item.id === row.id)).toEqual([]);
+  } finally { clock.mockRestore(); }
+});
+
+/** Files the automatic Continue for a silent turn exactly as the app does, and returns its row. */
+async function silentTurnContinue(title: string, advance: (ms: number) => number) {
+  const bridge = await import('../src/main/bridge.js');
+  const conversationId = randomUUID(), turnId = randomUUID(), questionId = randomUUID();
+  const session = await createSession({ title, conversationId });
+  await post('/events', { conversationId, events: [
+    { kind: 'model_selection', model: 'gpt-5.6-sol', time: Date.now() },
+    { kind: 'user_message', messageId: questionId, text: 'Finish the task', time: Date.now() },
+    { kind: 'turn_start', turnId, time: Date.now() }
+  ] });
+  await attributedMcp(conversationId);
+  await bridge.sweepStaleSwarm(advance(120_000));
+  const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs
+    .find((item: any) => item.conversationId === conversationId);
+  expect((await post('/repairs/claim', { token: repair.token })).body.allowed).toBe(true);
+  await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+  const row = (await input.listInputs()).find(item => item.sessionId === session.id && item.recovery)!;
+  expect(row).toMatchObject({ state: 'queued' });
+  return { conversationId, turnId, session, row };
+}
+
+it('ends a Continue the page refuses before claiming because its answer is finished', async () => {
+  // Measured 2026-10-02: a Continue filed for a turn whose final the app had missed was refused by
+  // every page before claiming, because ChatGPT showed that final. Nothing was reported, so the
+  // app reloaded the chat every fifteen minutes for six hours.
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false } });
+    const { conversationId, turnId, session, row } = await silentTurnContinue('Finished before Continue', ms => now += ms);
+
+    // Only for its own chat.
+    expect((await post('/input/claim', { id: row.id, owner: 'a-document', conversationId: randomUUID(), recoveryVeto: 'page-final' })).body.ok).toBe(false);
+    expect((await post('/input/claim', { id: row.id, owner: 'a-document', conversationId, recoveryVeto: 'page-final' })).body.ok).toBe(true);
+    expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ state: 'cancelled',
+      error: 'Automatic Continue was not needed: the page shows a finished answer.', recovery: { ended: 'page-final' } });
+
+    // Nothing changed since: the same turn does not get the same Continue back.
+    expect(await input.fileRecoveryInput(session.id, conversationId, turnId, false, () => true)).toBe(false);
+    // New work is a new situation, and may earn a restart again.
+    await attributedMcp(conversationId);
+    expect(await input.fileRecoveryInput(session.id, conversationId, turnId, false, () => true)).toBe(true);
+
+    // And only for an automatic Continue: a typed message is never ended by a page's verdict.
+    const typed = await input.enqueueInput({ ...message(session.id, 'off'), text: 'typed while waiting', mode: 'after-turn' });
+    expect((await post('/input/claim', { id: typed.id, owner: 'a-document', conversationId, recoveryVeto: 'page-final' })).body.ok).toBe(false);
+    expect((await input.listInputs()).find(item => item.id === typed.id)?.state).toBe('queued');
+  } finally { clock.mockRestore(); }
+});
+
+it.each([
+  { model: 'gpt-5.6-sol', alias: false }, { model: 'gpt-5.6-sol', alias: true },
+  { model: 'gpt-6-pro', alias: false }, { model: 'gpt-6-pro', alias: true }
+])('retires Goal only when queued input commits its exact source ($model, restored alias: $alias)', async ({ model, alias }) => {
   const store = await import('../src/main/session/store.js');
   const durable = await import('../src/main/durable.js');
   let now = Date.now();
@@ -142,7 +312,7 @@ it.each([false, true])('retires Goal only when queued input commits its exact so
     const row = await input.enqueueInput({ ...message(session.id, 'off'), automation: undefined, mode: 'after-turn' });
     now += 10;
     await post('/events', { conversationId, events: [
-      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'model_selection', model, time: now },
       { kind: 'turn_start', turnId: 'queue-source', time: now },
       { kind: 'assistant_message', turnId: 'queue-source', messageId: 'queue-source-answer', text: 'Current result', state: 'final', final: true, time: now + 1 },
       { kind: 'turn_end', turnId: 'queue-source', outcome: 'completed', time: now + 2 }
@@ -224,10 +394,21 @@ it('shows the approval reminder only after an authorized discovery handoff succe
     await vi.waitFor(() => expect(catalog.getChatModels().state).toBe('unavailable'));
     expect(notices()).toHaveLength(0);
 
+    // A fresh install has no Core tunnel yet, so ChatGPT cannot call a tool and has nothing to approve.
+    const config = getConfig();
+    await saveConfig({ ...config, tunnel: { ...config.tunnel, tunnelId: '' } });
+    catalog.resetChatModelsForTests();
+    await catalog.startChatModelDiscovery(true);
+    await vi.waitFor(() => expect(wake).toHaveBeenCalledTimes(2));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(notices()).toHaveLength(0);
+
+    await saveConfig({ ...config, tunnel: { ...config.tunnel, tunnelId: 'tunnel_test_core' } });
     catalog.resetChatModelsForTests();
     await catalog.startChatModelDiscovery(true);
     await vi.waitFor(() => expect(notices()).toHaveLength(1));
     expect(wake).toHaveBeenLastCalledWith(expect.stringContaining('https://chatgpt.com/?cos-model-catalog='), true, true);
+    await saveConfig(config);
   } finally { wake.mockRestore(); catalog.resetChatModelsForTests(); }
 });
 
@@ -252,6 +433,84 @@ it.each([false, true])('collects an exact recorded helper final across document 
     await expect(answer).resolves.toBe('{"next":"continue"}');
     expect(await input.pendingBrowserInputs()).toEqual([]);
   } finally { controller.abort(); await answer.catch(() => undefined); }
+});
+
+it.each([
+  { mode: 'auto', earlyEnd: false }, { mode: 'after-turn', earlyEnd: false }, { mode: 'finish', earlyEnd: false },
+  { mode: 'auto', earlyEnd: true }, { mode: 'after-turn', earlyEnd: true }, { mode: 'finish', earlyEnd: true }
+] as const)('delivers $mode queued during a delayed report of the current final (early end: $earlyEnd)', async ({ mode, earlyEnd }) => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const conversationId = randomUUID(), turnId = randomUUID();
+    const session = await createSession({ title: 'Delayed final and follow-up', conversationId });
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'user_message', messageId: randomUUID(), text: 'Inspect the current task', time: now },
+      { kind: 'turn_start', turnId, time: now }
+    ] });
+    await attributedMcp(conversationId);
+    const completedAt = now + 1000;
+    now += 2000;
+    if (earlyEnd) {
+      await post('/events', { conversationId, events: [{ kind: 'turn_end', turnId, outcome: 'completed', time: completedAt }] });
+      // A UI end without its final retains the same exact MCP-backed work grant.
+      expect(await input.sessionInputPolicy(session.id)).toMatchObject({ canInject: true, injectionTurnId: turnId, settled: false });
+    }
+    // The browser has finished, but its journal has not reached the app yet.
+    expect((await getSession(session.id))?.activeTurnId).toBe(earlyEnd ? null : turnId);
+    const row = await input.enqueueInput({ ...message(session.id, 'off'), mode });
+    const next = mode === 'auto' ? null : await input.enqueueInput({ ...message(session.id, 'off'), mode, text: 'A later checkpoint' });
+    expect((await input.pendingBrowserInputs()).some(item => item.id === row.id)).toBe(false);
+    const finalEvents = [
+      { kind: 'assistant_message', turnId, messageId: randomUUID(), text: 'The task is complete.',
+        state: 'final', final: true, activeNow: true, time: completedAt },
+      { kind: 'turn_end', turnId, outcome: 'completed', time: completedAt }
+    ];
+    await post('/events', { conversationId, events: finalEvents });
+    expect(await input.sessionInputPolicy(session.id)).toMatchObject({ browserAllowed: true, settled: true });
+    input.resetInputForTests();
+    expect((await input.pendingBrowserInputs()).some(item => item.id === row.id)).toBe(true);
+    expect((await input.listInputs()).find(item => item.id === row.id)?.queuedTurn).toEqual({ conversationId, turnId });
+    const { trackInFlight, emptyEvidence } = await import('../src/main/mcp/call-context.js');
+    await trackInFlight({ startedAt: now, transportKey: null, agent: null, outcome: null, evidence: emptyEvidence(),
+      caller: { requestId: randomUUID(), transportKey: null, conversationId } }, async () => {
+      expect((await input.pendingBrowserInputs()).some(item => item.id === row.id)).toBe(false);
+      expect(await input.claimBrowserInput(row.id, 'running-tool-document', conversationId, true)).toBeNull();
+    });
+    const claim = await input.claimBrowserInput(row.id, 'followup-document', conversationId, true);
+    expect(claim?.id).toBe(row.id);
+    expect(claim?.completedTurnId).toBe(turnId);
+    expect(await input.authorizeBrowserInput(row.id, 'followup-document', conversationId)).toBe(true);
+    expect(await input.authorizeBrowserInput(row.id, 'followup-document', conversationId)).toBe(false);
+    expect(await input.acknowledgeBrowserInput(row.id, 'followup-document', conversationId, randomUUID())).toBe(true);
+    await post('/events', { conversationId, events: finalEvents });
+    input.resetInputForTests();
+    expect((await input.pendingBrowserInputs()).some(item => item.id === row.id || item.id === next?.id)).toBe(false);
+    if (next) expect((await input.listInputs()).find(item => item.id === next.id)?.state).toBe('queued');
+  } finally { clock.mockRestore(); }
+});
+
+it.each(['after-turn', 'finish'] as const)('does not release %s queued after the answer was already recorded, including replay', async mode => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const conversationId = randomUUID(), turnId = randomUUID();
+    const session = await createSession({ title: 'Already completed queue boundary', conversationId });
+    const events = [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'user_message', messageId: randomUUID(), text: 'Original question', time: now },
+      { kind: 'turn_start', turnId, time: now },
+      { kind: 'assistant_message', turnId, messageId: randomUUID(), text: 'Already complete.', state: 'final', final: true, time: now },
+      { kind: 'turn_end', turnId, outcome: 'completed', time: now }
+    ];
+    await post('/events', { conversationId, events });
+    now += 2000;
+    const row = await input.enqueueInput({ ...message(session.id, 'off'), mode });
+    expect(row.queuedTurn).toBeUndefined();
+    await post('/events', { conversationId, events });
+    input.resetInputForTests();
+    expect((await input.pendingBrowserInputs()).some(item => item.id === row.id)).toBe(false);
+    expect(await input.claimBrowserInput(row.id, 'old-answer-document', conversationId, true)).toBeNull();
+  } finally { clock.mockRestore(); }
 });
 
 it('does not pin an idle chat to tool transport because another call is unattributed', async () => {
@@ -952,6 +1211,44 @@ it.each(['open', 'stalled', 'final-during-listen', 'failure-during-listen', 'fai
   } finally { clock.mockRestore(); }
 });
 
+it('continues an Extra High chat whose turn ended as failed after two minutes, not twenty', async () => {
+  // Measured 2026-10-01: an Extra High prime lost its stream twice; each turn ended as failed and
+  // the chat then sat toward its twenty-minute thinking window until its owner typed "continue".
+  const bridge = await import('../src/main/bridge.js');
+  await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoContinue: true } });
+  let now = Date.now();
+  const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const conversationId = randomUUID();
+    const session = await createSession({ title: 'Failed Extra High', conversationId });
+    const questionId = randomUUID(), turnId = randomUUID();
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', reasoningEffort: 'xhigh', time: now },
+      { kind: 'user_message', messageId: questionId, text: 'Finish the long task', time: now },
+      { kind: 'turn_start', turnId, time: now }
+    ] });
+    await attributedMcp(conversationId);
+    now += 5 * 60_000;
+    await bridge.sweepStaleSwarm(now);
+    expect((await post('/status', { openConversations: [conversationId] })).body.repairs
+      .some((row: any) => row.conversationId === conversationId)).toBe(false);
+
+    await post('/events', { conversationId, events: [
+      { kind: 'chat_error', text: 'Resume stream unavailable', recoverable: true, time: now },
+      { kind: 'turn_end', turnId, outcome: 'failed', time: now }
+    ] });
+    now += 2 * 60_000 + 1;
+    await bridge.sweepStaleSwarm(now);
+    const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs
+      .find((row: any) => row.conversationId === conversationId && row.reason === 'silence');
+    expect(repair, 'the failed turn waited for the long thinking window').toBeDefined();
+    if (repair.requiresClaim) expect((await post('/repairs/claim', { token: repair.token })).body.allowed).toBe(true);
+    await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+    expect((await input.listInputs()).find(row => row.sessionId === session.id && row.recovery))
+      .toMatchObject({ state: 'queued', recovery: { questionId, phase: 'ready' } });
+  } finally { clock.mockRestore(); }
+});
+
 it('commits a failed-source listening deadline while another chat observation is still recording', async () => {
   const bridge = await import('../src/main/bridge.js');
   const recorder = await import('../src/main/session/recorder.js');
@@ -1363,8 +1660,8 @@ describe('IPC input delivery and Goal control integration', () => {
   });
   it('requires an exact plugin claim and matching schema before a refresh completion', async () => {
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: true } });
-    const { publishPluginSurface, resetPluginRefreshForTests } = await import('../src/main/plugin-refresh.js');
-    resetPluginRefreshForTests();
+    const { publishPluginSurface, resetPluginRefreshForTests, setPluginRefreshTunnelGraceForTests } = await import('../src/main/plugin-refresh.js');
+    resetPluginRefreshForTests(); setPluginRefreshTunnelGraceForTests(0);
     const tools = [{ name: 'read', description: 'Read a file', inputSchema: { type: 'object', properties: {} } }];
     publishPluginSurface('core', 'Chat On Steroids Core', 'test', 'Synthetic instructions', tools);
     const requests = (await post('/plugin-refresh', { action: 'pending' })).body.requests;
@@ -1377,9 +1674,24 @@ describe('IPC input delivery and Goal control integration', () => {
     expect((await post('/plugin-refresh', { ...identity, action: 'complete', tools, versionId: 'asdk_app_v_synthetic' })).body.ok).toBe(true);
     resetPluginRefreshForTests();
   });
+  it('accepts a stale connector only by the tunnel id configured for its surface', async () => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, ui: { ...base.ui, autoRefreshPlugins: true }, tunnel: { ...base.tunnel, tunnelId: 'tunnel_core00001', desktopTunnelId: 'tunnel_desk00001' } });
+    const { publishPluginSurface, resetPluginRefreshForTests, setPluginRefreshTunnelGraceForTests } = await import('../src/main/plugin-refresh.js');
+    resetPluginRefreshForTests(); setPluginRefreshTunnelGraceForTests(0);
+    await writeDurableNow('plugin-refresh', []);
+    const tools = [{ name: 'computer', description: 'Current', inputSchema: { type: 'object', properties: {} } }];
+    publishPluginSurface('desktop', 'Chat On Steroids Desktop', 'test', '', tools);
+    const [request] = (await post('/plugin-refresh', { action: 'pending' })).body.requests;
+    const claim = (tunnelId?: string) => post('/plugin-refresh', { id: request.id, appId: 'asdk_app_desktop', action: 'claim', connectorName: 'Chat On Steroids Desktop', tools: [{ name: 'observe', description: 'Old', inputSchema: { type: 'object' } }], tunnelId });
+    expect((await claim()).body.ok).toBe(false);
+    expect((await claim('tunnel_core00001')).body.ok).toBe(false); // Core's tunnel is not Desktop's
+    expect((await claim('tunnel_desk00001')).body.ok).toBe(true);
+    resetPluginRefreshForTests();
+  });
   it('defaults automatic plugin refresh off and revokes an already offered claim without removing the backend', async () => {
     const plugin = await import('../src/main/plugin-refresh.js');
-    plugin.resetPluginRefreshForTests();
+    plugin.resetPluginRefreshForTests(); plugin.setPluginRefreshTunnelGraceForTests(0);
     await writeDurableNow('plugin-refresh', []);
     const tools = [{ name: 'read', description: 'Current declaration', inputSchema: { type: 'object', properties: {} } }];
     plugin.publishPluginSurface('core', 'Chat On Steroids Core', 'test', '', tools);
@@ -1399,12 +1711,12 @@ describe('IPC input delivery and Goal control integration', () => {
     await configure(false);
     // A click already accepted while enabled may still report its real result.
     expect((await post('/plugin-refresh', { ...claim, action: 'complete', tools })).body.ok).toBe(true);
-    plugin.resetPluginRefreshForTests();
+    plugin.resetPluginRefreshForTests(); plugin.setPluginRefreshTunnelGraceForTests(0);
   });
   it('accepts a manual plugin-refresh terminal state and removes it from browser pickup', async () => {
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: true } });
-    const { publishPluginSurface, resetPluginRefreshForTests } = await import('../src/main/plugin-refresh.js');
-    resetPluginRefreshForTests();
+    const { publishPluginSurface, resetPluginRefreshForTests, setPluginRefreshTunnelGraceForTests } = await import('../src/main/plugin-refresh.js');
+    resetPluginRefreshForTests(); setPluginRefreshTunnelGraceForTests(0);
     const tools = [{ name: 'read', description: 'Read current', inputSchema: { type: 'object', properties: {} } }];
     const installed = [{ ...tools[0], description: 'Read old' }];
     publishPluginSurface('core', 'Chat On Steroids Core', 'test', 'Synthetic instructions', tools);
@@ -1603,6 +1915,38 @@ describe('IPC input delivery and Goal control integration', () => {
     await input.offerToolInput(session.id, conversationId, 'overlapping-request', 0);
     expect(goal.goalSwitchFor(conversationId).enabled).toBe(false);
   });
+  it.each([2700, 24000])('keeps one reserved session per intentional send even when opening text is identical (%s chars)', async size => {
+    const store = await import('../src/main/session/store.js');
+    const before = new Set((await store.listAllSessions()).map(session => session.id));
+    const requests = [message(null, 'off'), message(null, 'off')].map(request => ({ ...request,
+      text: 'Keep the literal `code`, $variables and multilingual text: Grüße 世界.\n'.repeat(400).slice(0, size) }));
+    for (const request of requests) {
+      expect((await handlers.get('sessions:send')!(null, request)).ok).toBe(true);
+      const owner = `document-${request.id}`, conversationId = randomUUID(), messageId = randomUUID();
+      const claim = await post('/input/claim', { id: request.id, owner, conversationId: null, requiresAuthorization: true });
+      expect(claim.body.input).toMatchObject({ id: request.id, sessionId: request.id, opening: true });
+      expect((await post('/input/claim', { id: request.id, owner, conversationId: null, authorize: true })).body.ok).toBe(true);
+      const receipt = { id: request.id, owner, conversationId, messageId };
+      expect((await post('/input/bind', receipt)).body.ok).toBe(true);
+      const evidence = await post('/events', { conversationId, events: [
+        { kind: 'model_selection', model: 'gpt-5.6-sol', time: Date.now() },
+        { kind: 'user_message', messageId, text: claim.body.input.text, time: Date.now() }
+      ] });
+      expect(evidence.status).toBe(200);
+      expect((await post('/input/ack', receipt)).body.ok).toBe(true);
+      // An acknowledgement or route-binding replay must never mint a second owner.
+      expect((await post('/input/bind', receipt)).body.ok).toBe(true);
+      expect((await post('/input/ack', receipt)).body.ok).toBe(true);
+      expect((await store.findSessionByConversation(conversationId, { requireUnique: true }))?.id).toBe(request.id);
+      expect((await input.listInputs()).find(row => row.id === request.id)).toMatchObject({
+        state: 'sent', sessionId: request.id, deliveredSessionId: request.id, conversationId, messageId
+      });
+      const users = await store.readRecentEvents(request.id, 10, { kinds: ['user_message'] });
+      expect(users).toHaveLength(1);
+    }
+    expect((await store.listAllSessions()).filter(session => !before.has(session.id)).map(session => session.id).sort())
+      .toEqual(requests.map(request => request.id).sort());
+  });
   it('binds a new chat through HTTP ACK, applies its choice once, and pushes session change', async () => {
     const request = message(null, 'goal');
     await handlers.get('sessions:send')!(null, request);
@@ -1730,7 +2074,129 @@ describe('native progress silence authority', () => {
     await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
   }
 
+  /**
+   * A rescue that was withdrawn must not stand in for the one the chat still needs.
+   *
+   * The ticket is cancelled for a good reason — the chat resumed on its own, so typing into it
+   * would be noise — but the check that keeps one ticket per turn counted the cancelled row all
+   * the same. Watched live on 2026-09-23: a rescue filed at 20:32:35, cancelled fifteen seconds
+   * later as "the source received new work", and the same turn broke again two minutes after
+   * that. The second rescue was refused on the strength of the first, and the chat sat until its
+   * owner typed into it.
+   */
+  it('files a second rescue for a turn whose first was cancelled without ever sending', async () => {
+    const source = await open('gpt-5.6-sol');
+    expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true)).toBe(true);
+    const first = (await input.listInputs()).find(row => row.recovery)!;
+    expect(first.silenceBoundary?.turnId).toBe(source.turnId);
+
+    // Withdrawn because the chat carried on by itself — nothing was ever sent.
+    expect(await input.cancelInput(first.id)).toBe(true);
+    expect((await input.listInputs()).find(row => row.id === first.id)?.state).toBe('cancelled');
+
+    // The same turn breaks again. This is the rescue that used to be refused.
+    expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true),
+      'a cancelled ticket still blocked the turn it never answered').toBe(true);
+    const live = (await input.listInputs()).filter(row => row.recovery && row.state === 'queued');
+    expect(live).toHaveLength(1);
+    expect(live[0]!.id).not.toBe(first.id);
+  });
+
+  it('keeps authored queued work ahead of automatic Continue after a committed handoff', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const source = await open('gpt-5.6-sol');
+      expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true)).toBe(true);
+      const recovery = (await input.listInputs()).find(row => row.recovery)!;
+      expect(await input.claimBrowserInput(recovery.id, 'old-document', source.conversationId, true)).not.toBeNull();
+      expect(await input.authorizeBrowserInput(recovery.id, 'old-document', source.conversationId)).toBe(true);
+      const queued = await input.enqueueInput({ ...message(source.session.id, 'off'), mode: 'after-turn', text: 'Check the original requirement next.' });
+      const destination = randomUUID(), nextTurn = randomUUID();
+      expect(await rebindSession(source.session.id, source.conversationId, destination)).toBe(true);
+      input.resetInputForTests();
+      await post('/events', { conversationId: destination, events: [
+        { kind: 'model_selection', model: 'gpt-5.6-sol', time: ++now },
+        { kind: 'user_message', messageId: randomUUID(), text: 'Continue the original task', time: now, authoredNow: true },
+        { kind: 'turn_start', turnId: nextTurn, time: now }
+      ] });
+      await attributedMcp(destination);
+      expect(await input.fileRecoveryInput(source.session.id, destination, nextTurn, false, () => true)).toBe(false);
+      expect((await input.listInputs()).find(row => row.id === queued.id)).toEqual(queued);
+      expect((await input.listInputs()).find(row => row.id === recovery.id)?.state).toBe('cancelled');
+      await post('/events', { conversationId: destination, events: [
+        { kind: 'assistant_message', turnId: nextTurn, messageId: randomUUID(), text: 'The current task is done.', state: 'final', final: true, time: ++now },
+        { kind: 'turn_end', turnId: nextTurn, outcome: 'completed', time: ++now }
+      ] });
+      expect((await input.pendingBrowserInputs()).find(row => row.id === queued.id)).toMatchObject({ conversationId: destination, supersededConversationId: source.conversationId });
+      expect(await input.claimBrowserInput(queued.id, 'next-document', destination, true)).toMatchObject({ text: queued.text });
+      expect(await input.authorizeBrowserInput(queued.id, 'next-document', destination)).toBe(true);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(['authored', 'foreign', 'unnamed', 'missing-session', 'companion'] as const)(
+    'keeps an uncertain %s browser claim through a handoff and restart', async kind => {
+      const source = await open('gpt-5.6-sol');
+      expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true)).toBe(true);
+      const pending = (await input.listInputs()).find(row => row.recovery)!;
+      expect(await input.claimBrowserInput(pending.id, 'retained-owner', source.conversationId, true)).not.toBeNull();
+      expect(await input.authorizeBrowserInput(pending.id, 'retained-owner', source.conversationId)).toBe(true);
+      const claimed = (await input.listInputs()).find(row => row.id === pending.id)!;
+      if (kind === 'authored') { delete claimed.recovery; delete claimed.silenceBoundary; claimed.text = 'An authored browser message'; }
+      if (kind === 'foreign') { claimed.conversationId = randomUUID(); claimed.silenceBoundary!.conversationId = claimed.conversationId; }
+      if (kind === 'unnamed') claimed.conversationId = null;
+      if (kind === 'missing-session') claimed.sessionId = randomUUID();
+      if (kind === 'companion') claimed.companionInputId = randomUUID();
+      const rows = claimed.companionInputId ? [claimed, { ...claimed, id: claimed.companionInputId,
+        companionInputId: undefined, recovery: undefined, silenceBoundary: undefined, text: 'An authored companion' }] : [claimed];
+      await writeDurableNow('session-input', rows);
+      expect(await rebindSession(source.session.id, source.conversationId, randomUUID())).toBe(true);
+      input.resetInputForTests();
+      const restored = await input.listInputs();
+      expect(restored).toEqual(rows);
+      expect(await input.claimBrowserInput(claimed.id, 'replacement-owner', source.conversationId, true)).toBeNull();
+    });
+
   for (const model of ['gpt-5.6-sol', 'gpt-5.6-pro']) {
+    it.each([false, true])(`releases only a departed automatic Continue and preserves its exact late receipt (${model}, restored: %s)`, async restored => {
+      let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+      try {
+        const source = await open(model);
+        expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, model.endsWith('pro'), () => true)).toBe(true);
+        const pending = (await input.listInputs()).find(row => row.sessionId === source.session.id && row.recovery)!;
+        expect(await input.claimBrowserInput(pending.id, 'departed-document', source.conversationId, true)).not.toBeNull();
+        expect(await input.authorizeBrowserInput(pending.id, 'departed-document', source.conversationId)).toBe(true);
+        const authorized = (await input.listInputs()).find(row => row.id === pending.id)!;
+
+        now += 16 * 60_000;
+        expect((await input.listInputs()).find(row => row.id === pending.id)).toEqual(authorized);
+        expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, model.endsWith('pro'), () => true)).toBe(false);
+        const destination = randomUUID(), nextTurn = randomUUID();
+        expect(await rebindSession(source.session.id, source.conversationId, destination)).toBe(true);
+        if (restored) input.resetInputForTests();
+        await post('/events', { conversationId: destination, events: [
+          { kind: 'model_selection', model, time: ++now },
+          { kind: 'user_message', messageId: randomUUID(), text: 'Finish the original task in this chat', time: now, authoredNow: true },
+          { kind: 'turn_start', turnId: nextTurn, time: now }
+        ] });
+        await attributedMcp(destination);
+        expect(await input.fileRecoveryInput(source.session.id, destination, nextTurn, model.endsWith('pro'), () => true)).toBe(true);
+        const rows = await input.listInputs();
+        expect(rows.find(row => row.id === pending.id)).toEqual({ ...authorized, state: 'cancelled' });
+        const successor = rows.find(row => row.sessionId === source.session.id && row.state === 'queued')!;
+        expect(successor.conversationId).toBe(destination);
+        expect(await input.claimBrowserInput(successor.id, 'successor-document', destination, true)).not.toBeNull();
+        expect(await input.claimBrowserInput(pending.id, 'new-document', destination, true)).toBeNull();
+        expect(await input.acknowledgeBrowserInput(pending.id, 'wrong-document', source.conversationId, 'late-confirmation')).toBe(false);
+        expect(await input.acknowledgeBrowserInput(pending.id, 'departed-document', destination, 'late-confirmation')).toBe(false);
+        expect(await input.acknowledgeBrowserInput(pending.id, 'departed-document', source.conversationId, 'late-confirmation')).toBe(true);
+        expect((await input.listInputs()).find(row => row.id === pending.id)).toMatchObject({
+          state: 'cancelled', conversationId: source.conversationId, owner: authorized.owner,
+          sendAuthorizedAt: authorized.sendAuthorizedAt, messageId: 'late-confirmation', deliveredSessionId: source.session.id
+        });
+        expect((await getSession(source.session.id))?.conversationId).toBe(destination);
+      } finally { clock.mockRestore(); }
+    });
+
     it.each(['none', 'previous', 'request'] as const)(`never intervenes in ${model} without current-turn MCP (%s)`, async proof => {
       let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
       try {
@@ -1992,6 +2458,85 @@ describe.each(['off', 'goal', 'loop'] as const)('shared automatic Continue (%s)'
     } finally { clock.mockRestore(); }
   });
 
+  it.each(['queued', 'claimed', 'authorized'] as const)('hands a late final from %s Continue back to the active driver', async phase => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const { row, conversationId, session, turnId } = await silent('gpt-5.6-sol', ms => { now += ms; });
+      if (mode !== 'off') await goal.setGoalObjectiveNow(conversationId, 'Finish the remaining implementation');
+      const claim = { id: row.id, owner: 'late-final-document', conversationId };
+      if (phase !== 'queued') expect((await post('/input/claim', { ...claim, requiresAuthorization: true })).body.input).toBeDefined();
+      if (phase === 'authorized') expect((await post('/input/claim', { ...claim, authorize: true })).body.ok).toBe(true);
+      // The native pre-click check discovers and journals the actual final after
+      // the app has granted permission, but before any native Send was attempted.
+      const final = { kind: 'assistant_message', messageId: randomUUID(), providerMessageId: randomUUID(), turnId,
+        text: 'The first part is ready. The remaining implementation still needs work.',
+        state: 'final', final: true, activeNow: true, goalEligible: true, time: ++now };
+      expect((await post('/events', { conversationId, events: [final] })).status).toBe(200);
+      if (phase === 'authorized') {
+        const failure = { ...claim, error: 'After-turn pickup was withdrawn before Send.' };
+        expect((await post('/input/fail', { ...failure, owner: 'different-document' })).body.ok).toBe(false);
+        expect(await input.inputBeforeGoal(session.id, turnId)).toBe('queued');
+        expect((await post('/input/fail', failure)).body.ok).toBe(true);
+        expect((await post('/input/fail', failure)).body.ok).toBe(false);
+        expect(await input.acknowledgeBrowserInput(row.id, claim.owner, conversationId, 'impossible-receipt')).toBe(false);
+        expect((await input.listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'failed', sendAuthorizedAt: expect.any(Number) });
+      }
+      input.resetInputForTests();
+      expect(await input.inputBeforeGoal(session.id, turnId)).toBeNull();
+      expect((await input.pendingBrowserInputs()).some(entry => entry.id === row.id)).toBe(false);
+      expect(await input.authorizeBrowserInput(row.id, claim.owner, conversationId)).toBe(false);
+      if (mode === 'off') expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
+      else {
+        expect(goal.goalPendingReplyFor(conversationId)?.replyId).toBe(final.messageId);
+        now += 60_000;
+        const result = await post('/goal/draft', { conversationId, turnId, clientId: claim.owner, terminalRequired: true });
+        expect(result.status).toBe(200);
+        let helper: Awaited<ReturnType<typeof input.listInputs>>[number] | undefined;
+        await vi.waitFor(async () => {
+          helper = (await input.listInputs()).find(entry => entry.purpose === 'decision' && entry.decisionSourceSessionId === session.id);
+          expect(helper).toBeDefined();
+        });
+        const helperClaim = { id: helper!.id, owner: 'decision-document', conversationId: null };
+        const prepared = (await post('/input/claim', { ...helperClaim, requiresAuthorization: true })).body.input;
+        expect(prepared.text).toContain(final.text);
+        expect((await post('/input/claim', { ...helperClaim, authorize: true })).body.ok).toBe(true);
+        expect((await post('/input/ack', { ...helperClaim, messageId: 'decision-question' })).body.ok).toBe(true);
+        expect((await post('/input/answer', { ...helperClaim,
+          response: JSON.stringify({ action: 'continue', reply: 'Finish the remaining implementation and verify it.' }) })).body.ok).toBe(true);
+        await vi.waitFor(() => expect(goal.goalViewFor(conversationId)?.stage).toBe('ready'));
+        expect(goal.goalViewFor(conversationId)?.reply).toBeTruthy();
+        expect(goal.goalViewFor(conversationId)?.reply).not.toBe(row.text);
+      }
+    } finally { clock.mockRestore(); }
+  });
+
+  it('keeps an ambiguous Continue exclusive until its exact native receipt arrives', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const { row, conversationId, session, turnId } = await silent('gpt-5.6-sol', ms => { now += ms; });
+      if (mode !== 'off') await goal.setGoalObjectiveNow(conversationId, 'Finish the remaining implementation');
+      expect(await input.claimBrowserInput(row.id, 'uncertain-document', conversationId, true)).not.toBeNull();
+      expect(await input.authorizeBrowserInput(row.id, 'uncertain-document', conversationId)).toBe(true);
+      await post('/events', { conversationId, events: [{ kind: 'assistant_message',
+        messageId: randomUUID(), providerMessageId: randomUUID(), turnId, text: 'The first part is ready.',
+        state: 'final', final: true, activeNow: true, goalEligible: true, time: ++now }] });
+      input.resetInputForTests();
+      expect(await input.inputBeforeGoal(session.id, turnId)).toBe('queued');
+      expect(await input.failBrowserInput(row.id, 'uncertain-document', 'The response timed out')).toBe(false);
+      expect(await input.inputBeforeGoal(session.id, turnId)).toBe('queued');
+      expect(await input.claimBrowserInput(row.id, 'replacement-document', conversationId, true)).toBeNull();
+      expect(await input.authorizeBrowserInput(row.id, 'uncertain-document', conversationId)).toBe(false);
+      if (mode !== 'off') {
+        expect(goal.goalPendingReplyFor(conversationId)).not.toBeNull();
+        const result = await post('/goal/draft', { conversationId, turnId, clientId: 'replacement-document', terminalRequired: true });
+        expect(result.body.error).toBe('user_input_pending');
+      }
+      expect(await input.acknowledgeBrowserInput(row.id, 'uncertain-document', conversationId, 'actual-continue-message')).toBe(true);
+      expect(await input.inputBeforeGoal(session.id, turnId)).toBe('consumed');
+      expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
+    } finally { clock.mockRestore(); }
+  });
+
   it('gives Pro five full minutes after a delayed reload acknowledgement', async () => {
     let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
     try {
@@ -2012,7 +2557,7 @@ describe.each(['off', 'goal', 'loop'] as const)('shared automatic Continue (%s)'
     } finally { clock.mockRestore(); }
   });
 
-  it('withdraws Continue while a newly admitted local tool is running', async () => {
+  it('holds Continue during a local tool and cancels it when that source records new work', async () => {
     let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
     const calls = await import('../src/main/mcp/call-context.js');
     let release: (() => void) | undefined;
@@ -2023,6 +2568,8 @@ describe.each(['off', 'goal', 'loop'] as const)('shared automatic Continue (%s)'
         evidence: calls.emptyEvidence(), caller: { conversationId, requestId: randomUUID(), transportKey: null } },
         () => new Promise<void>(resolve => { release = resolve; }));
       expect(await input.claimBrowserInput(row.id, 'busy-tool-doc', conversationId, true)).toBeNull();
+      expect((await input.listInputs()).find(entry => entry.id === row.id)?.state).toBe('queued');
+      await attributedMcp(conversationId);
       expect((await input.listInputs()).find(entry => entry.id === row.id)?.state).toBe('cancelled');
     } finally { release?.(); await running; clock.mockRestore(); }
   });
@@ -2067,6 +2614,115 @@ describe.each(['off', 'goal', 'loop'] as const)('shared automatic Continue (%s)'
       expect(await input.claimBrowserInput(row.id, 'late-doc', conversationId, true)).toBeNull();
       expect((await input.listInputs()).find(entry => entry.id === row.id)?.state).toBe('cancelled');
       expect(goal.goalPendingReplyFor(conversationId)?.replyId ?? null).toBe(mode === 'off' ? null : messageId);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(['running', 'settling'] as const)('keeps the same Continue ticket while an unrelated tool is still unassigned (%s)', async phase => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const calls = await import('../src/main/mcp/call-context.js');
+    let release!: () => void;
+    let work: Promise<void> | undefined;
+    try {
+      const { row, conversationId } = await silent('gpt-5.6-pro', ms => { now += ms; });
+      const context = { startedAt: now, transportKey: null, agent: null, outcome: null,
+        evidence: calls.emptyEvidence(), caller: { conversationId: null as string | null, requestId: randomUUID(), transportKey: null } };
+      const pending = new Promise<void>(resolve => { release = resolve; });
+      if (phase === 'running') work = calls.trackInFlight(context, () => pending);
+      else { calls.holdWhileSettling(context, pending); work = pending; }
+      expect((await input.pendingBrowserInputs()).some(entry => entry.id === row.id)).toBe(false);
+      expect(await input.claimBrowserInput(row.id, 'held-doc', conversationId, true)).toBeNull();
+      input.resetInputForTests();
+      expect((await input.listInputs()).find(entry => entry.id === row.id)).toMatchObject({
+        state: 'queued', owner: null, recovery: row.recovery, silenceBoundary: row.silenceBoundary
+      });
+      // Exact evidence assigns the tool to a different chat while the call is still live.
+      context.caller.conversationId = randomUUID();
+      expect((await input.pendingBrowserInputs()).find(entry => entry.id === row.id)).toBeDefined();
+      expect(await input.claimBrowserInput(row.id, 'held-doc', conversationId, true)).not.toBeNull();
+      expect(await input.authorizeBrowserInput(row.id, 'held-doc', conversationId)).toBe(true);
+      expect(await input.authorizeBrowserInput(row.id, 'held-doc', conversationId)).toBe(false);
+    } finally { release?.(); await work; clock.mockRestore(); }
+  });
+
+  it('retains a claimed Continue across unrelated activity without granting Stop or Send', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const calls = await import('../src/main/mcp/call-context.js');
+    let release!: () => void;
+    let work: Promise<void> | undefined;
+    try {
+      const { row, conversationId, turnId } = await silent('gpt-5.6-pro', ms => { now += ms; });
+      expect(await input.deferSilenceInput(row.id, conversationId, turnId)).toBe(true);
+      now = row.recovery!.busyUntil;
+      expect(await input.claimBrowserInput(row.id, 'claimed-doc', conversationId, true)).not.toBeNull();
+      work = calls.trackInFlight({ startedAt: now, transportKey: null, agent: null, outcome: null,
+        evidence: calls.emptyEvidence(), caller: { conversationId: null, requestId: randomUUID(), transportKey: null } },
+        () => new Promise<void>(resolve => { release = resolve; }));
+      expect(await input.advanceRecoveryInput(row.id, 'claimed-doc', conversationId, 'stop')).toBe(false);
+      expect(await input.authorizeBrowserInput(row.id, 'claimed-doc', conversationId)).toBe(false);
+      expect((await input.listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'browser', owner: 'claimed-doc' });
+      release(); await work;
+      expect(await input.advanceRecoveryInput(row.id, 'claimed-doc', conversationId, 'stop')).toBe(true);
+      expect(await input.advanceRecoveryInput(row.id, 'claimed-doc', conversationId, 'stop')).toBe(false);
+      expect(await input.advanceRecoveryInput(row.id, 'claimed-doc', conversationId, 'stopped')).toBe(true);
+      expect(await input.authorizeBrowserInput(row.id, 'claimed-doc', conversationId)).toBe(true);
+      expect(await input.authorizeBrowserInput(row.id, 'claimed-doc', conversationId)).toBe(false);
+    } finally { release?.(); await work; clock.mockRestore(); }
+  });
+
+  it.each(['gpt-5.6-sol', 'gpt-5.6-pro'])('keeps Continue and its Stop deadline when reload re-observes the same question with different text (%s)', async model => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const { row, conversationId, turnId, session } = await silent(model, ms => { now += ms; });
+      const store = await import('../src/main/session/store.js');
+      for (const [index, text] of ['Finish the requested task…', 'Finish the requested task\nwith the existing results.'].entries()) {
+        await post('/events', { conversationId, events: [{ kind: 'user_message',
+          messageId: row.recovery!.questionId, text, ...(index === 0 ? { authoredNow: false } : {}), time: ++now }] });
+        expect((await input.listInputs()).find(entry => entry.id === row.id)).toMatchObject({
+          state: 'queued', silenceBoundary: { workSeq: row.silenceBoundary!.workSeq },
+          recovery: { busyUntil: row.recovery!.busyUntil }
+        });
+        expect((await store.readLatestUserMessage(session.id))?.message.text).toBe(text);
+      }
+      expect(await input.deferSilenceInput(row.id, conversationId, turnId)).toBe(true);
+      now = row.recovery!.busyUntil - 1;
+      expect((await input.pendingBrowserInputs()).some(entry => entry.id === row.id)).toBe(false);
+      now++;
+      expect((await input.pendingBrowserInputs()).find(entry => entry.id === row.id)?.recovery?.stop).toBe(true);
+      expect(await input.claimBrowserInput(row.id, 'reloaded-question-doc', conversationId, true)).not.toBeNull();
+      expect(await input.advanceRecoveryInput(row.id, 'reloaded-question-doc', conversationId, 'stop')).toBe(true);
+      expect(await input.advanceRecoveryInput(row.id, 'reloaded-question-doc', conversationId, 'stop')).toBe(false);
+      expect(await input.authorizeBrowserInput(row.id, 'reloaded-question-doc', conversationId)).toBe(false);
+      expect(await input.advanceRecoveryInput(row.id, 'reloaded-question-doc', conversationId, 'stopped')).toBe(true);
+      expect(await input.authorizeBrowserInput(row.id, 'reloaded-question-doc', conversationId)).toBe(true);
+      expect(await input.authorizeBrowserInput(row.id, 'reloaded-question-doc', conversationId)).toBe(false);
+      const nextQuestion = randomUUID(), nextTurn = randomUUID();
+      expect(await input.acknowledgeBrowserInput(row.id, 'reloaded-question-doc', conversationId, nextQuestion)).toBe(true);
+      expect(await input.acknowledgeBrowserInput(row.id, 'reloaded-question-doc', conversationId, nextQuestion)).toBe(true);
+      expect((await input.listInputs()).filter(entry => entry.id === row.id && entry.state === 'sent')).toHaveLength(1);
+      await post('/events', { conversationId, events: [
+        { kind: 'turn_end', turnId, outcome: 'interrupted', reason: 'automation_silence', time: ++now },
+        { kind: 'user_message', messageId: nextQuestion, text: row.text, authoredNow: true, time: ++now },
+        { kind: 'turn_start', turnId: nextTurn, time: now }
+      ] });
+      await attributedMcp(conversationId);
+      const bridge = await import('../src/main/bridge.js');
+      now += (model === 'gpt-5.6-pro' ? 600_000 : 120_000) - 1;
+      await bridge.sweepStaleSwarm(now);
+      const pending = () => post('/status', { openConversations: [conversationId] });
+      expect((await pending()).body.repairs.some((repair: any) => repair.conversationId === conversationId)).toBe(false);
+      now += 2;
+      await bridge.sweepStaleSwarm(now);
+      const repair = (await pending()).body.repairs.find((repair: any) => repair.conversationId === conversationId);
+      expect(repair?.reason).toBe('silence');
+      expect((await post('/repairs/claim', { token: repair.token })).body.allowed).toBe(true);
+      await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+      const next = (await input.listInputs()).find(entry => entry.sessionId === session.id && entry.state === 'queued' && entry.recovery)!;
+      expect(next.id).not.toBe(row.id);
+      expect(next.recovery?.questionId).toBe(nextQuestion);
+      expect(next.silenceBoundary?.turnId).toBe(nextTurn);
+      expect(await input.deferSilenceInput(next.id, conversationId, nextTurn)).toBe(true);
+      now = next.recovery!.busyUntil;
+      expect((await input.pendingBrowserInputs()).find(entry => entry.id === next.id)?.recovery?.stop).toBe(true);
     } finally { clock.mockRestore(); }
   });
 
@@ -2174,7 +2830,7 @@ describe.each(['off', 'goal', 'loop'] as const)('shared automatic Continue (%s)'
     } finally { clock.mockRestore(); }
   });
 
-  it.each(['final', 'stop', 'question', 'activity', 'setting', 'rebind', 'input'] as const)(
+  it.each(['final', 'stop', 'question', 'edited-question', 'activity', 'setting', 'block', 'rebind', 'input'] as const)(
     'cancels a pending recovery on %s before any send or stop', async change => {
       let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
       try {
@@ -2185,15 +2841,94 @@ describe.each(['off', 'goal', 'loop'] as const)('shared automatic Continue (%s)'
         ] });
         if (change === 'stop') await post('/events', { conversationId, events: [{ kind: 'turn_end', turnId, outcome: 'stopped', time: now }] });
         if (change === 'question') await post('/events', { conversationId, events: [{ kind: 'user_message', messageId: randomUUID(), text: 'A newer instruction', time: now }] });
+        if (change === 'edited-question') await post('/events', { conversationId, events: [{ kind: 'user_message',
+          messageId: row.recovery!.questionId, text: 'An explicitly authored change', authoredNow: true, time: now }] });
         if (change === 'activity') await attributedMcp(conversationId);
         if (change === 'setting') {
           await goal.setGoalSwitchNow(conversationId, mode === 'off' ? 'goal' : mode, false);
           await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoContinue: false } });
         }
+        if (change === 'block') (await import('../src/main/session/blocked-chats.js')).setChatBlocked(conversationId, true);
         if (change === 'rebind') await rebindSession(session.id, conversationId, randomUUID());
         if (change === 'input') await input.enqueueInput({ ...message(session.id, 'off'), mode: 'after-turn' });
         expect(await input.claimBrowserInput(row.id, 'late-doc', conversationId, true)).toBeNull();
-        expect((await input.listInputs()).find(entry => entry.id === row.id)?.state).toBe('cancelled');
+        const cancelled = (await input.listInputs()).find(entry => entry.id === row.id)!;
+        expect(cancelled.state).toBe('cancelled');
+        if (change === 'block') expect(cancelled.error).toBe('Automatic Continue cancelled: this chat is blocked.');
+        if (change === 'question') expect(cancelled.error).toBe('Automatic Continue cancelled: another user message arrived.');
       } finally { clock.mockRestore(); }
     });
+});
+
+it('retires a lost authorized browser receipt so the session accepts and delivers the next user message', async () => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const conversationId = randomUUID(), turnId = randomUUID();
+    const session = await createSession({ title: 'Lost send receipt', conversationId });
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'turn_start', turnId, time: now },
+      { kind: 'assistant_message', messageId: randomUUID(), turnId, text: 'Done.', state: 'final', final: true, time: ++now },
+      { kind: 'turn_end', turnId, outcome: 'completed', time: ++now }
+    ] });
+    const lost = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'First request' });
+    expect(await input.claimBrowserInput(lost.id, 'lost-document', conversationId, true)).not.toBeNull();
+    expect(await input.authorizeBrowserInput(lost.id, 'lost-document', conversationId)).toBe(true);
+    // The receipt never arrives, so the uncertain claim still owns the whole session.
+    await expect(input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'Second request' }))
+      .rejects.toThrow('One message is already awaiting delivery');
+    now += 899_999;
+    input.resetInputForTests();
+    expect((await input.listInputs()).find(item => item.id === lost.id)?.state).toBe('browser');
+    await expect(input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'Second request' }))
+      .rejects.toThrow('One message is already awaiting delivery');
+    // The bounded wait elapses across a restart, and the lost outcome is now visible.
+    now += 1;
+    input.resetInputForTests();
+    expect((await input.listInputs()).find(item => item.id === lost.id)).toMatchObject({
+      state: 'cancelled',
+      error: 'Stopped waiting for delivery confirmation. The message may already have been sent; it will not be resent.'
+    });
+    // A terminal row is never offered or replayed, so at-most-once delivery is unchanged.
+    expect((await input.pendingBrowserInputs()).map(item => item.id)).not.toContain(lost.id);
+    expect(await input.claimBrowserInput(lost.id, 'replacement-document', conversationId, true)).toBeNull();
+    const next = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'Second request' });
+    expect(await input.claimBrowserInput(next.id, 'replacement-document', conversationId, true)).not.toBeNull();
+  } finally { clock.mockRestore(); }
+});
+
+it('retires an opening send whose receipt never arrives after six hours, and not before', async () => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    // Measured 2026-09-27: first messages of app-started chats stayed in `browser` for days.
+    const request = message(null, 'off');
+    expect((await handlers.get('sessions:send')!(null, request)).ok).toBe(true);
+    const owner = `document-${request.id}`;
+    expect((await post('/input/claim', { id: request.id, owner, conversationId: null, requiresAuthorization: true })).body.input).toMatchObject({ opening: true });
+    expect((await post('/input/claim', { id: request.id, owner, conversationId: null, authorize: true })).body.ok).toBe(true);
+    now += 15 * 60_000 + 1; // past the ordinary bound, which leaves openings in custody
+    input.resetInputForTests();
+    expect((await input.listInputs()).find(row => row.id === request.id)?.state).toBe('browser');
+    now += 6 * 60 * 60_000;
+    input.resetInputForTests();
+    expect((await input.listInputs()).find(row => row.id === request.id)).toMatchObject({
+      state: 'cancelled',
+      error: 'Stopped waiting for delivery confirmation. The message may already have been sent; it will not be resent.'
+    });
+    expect((await input.pendingBrowserInputs()).map(row => row.id)).not.toContain(request.id);
+  } finally { clock.mockRestore(); }
+});
+
+describe('this install\'s connector names', () => {
+  it('reach the extension with every status reply, and follow a changed suffix at once', async () => {
+    await saveConfig(defaultConfig());
+    expect((await post('/status', { openConversations: [] })).body.connectorNames).toEqual({
+      core: 'Chat On Steroids Core', desktop: 'Chat On Steroids Desktop', plugins: 'Chat On Steroids Plugins'
+    });
+    await saveConfig({ ...defaultConfig(), connectorSuffix: 'Windows' });
+    expect((await post('/status', { openConversations: [] })).body.connectorNames).toEqual({
+      core: 'Chat On Steroids Core (Windows)', desktop: 'Chat On Steroids Desktop (Windows)', plugins: 'Chat On Steroids Plugins (Windows)'
+    });
+    await saveConfig(defaultConfig());
+  });
 });

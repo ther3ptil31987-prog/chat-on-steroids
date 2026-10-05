@@ -3,6 +3,10 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { TaskRequestError } from '../src/main/task-request.js';
+
+// Loaded CI runners (Windows especially) can take longer than waitFor's 1 s default to reach
+// the asynchronous follow-up; the conditions themselves are unchanged.
+const WAIT = { timeout: 10_000 };
 const hooks = vi.hoisted(() => ({ caller: { sessionId: '', conversationId: '' }, startedAt: 2000, followup: vi.fn(), enqueue: vi.fn(), hasInput: true, delivered: [] as Array<{ id: string; sessionId: string; text: string; state: string }>, inputListeners: new Set<() => void>() }));
 vi.mock('../src/main/session/input.js', () => ({
   hasEligibleToolInput: async () => hooks.hasInput,
@@ -15,11 +19,12 @@ vi.mock('../src/main/goal.js', async importOriginal => ({ ...await importOrigina
 vi.mock('../src/main/mcp/call-context.js', async (importOriginal) => ({
   ...await importOriginal<object>(), currentCall: () => ({ caller: { ...hooks.caller }, startedAt: hooks.startedAt })
 }));
-const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
+const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSessionStore, createSession, getSession, rebindSession, appendEvent, readRecentEvents, flushSessions, resetSessionStoreForTests, observeSessionModel } = await import('../src/main/session/store.js');
 const { resetRecorderForTests } = await import('../src/main/session/recorder.js');
 const { announceSessionFinish: announceTransport, sessionFinishDeadline, settleSessionFinishForTests, requestSessionFinishGoal, sessionFinishWaiting, setFinishNotifier, releaseSessionFinish, sessionFinishHeld, getSessionFinishDraft } = await import('../src/main/session/finish.js');
 const { setGoalSwitchNow, automaticFinishEnabled, snapshotGoalSwitches, restoreGoalSwitches, registerGoalDecisionChat } = await import('../src/main/goal.js');
+const { resetAgentsForTests, spawn, bindConversation, finishAgent, waitingForSubAgents } = await import('../src/main/agents.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
 async function announceSessionFinish(sessionId: string, summary: string): Promise<string> {
   const result = await announceTransport(sessionId, summary);
@@ -84,7 +89,7 @@ describe('session finish turn identity', () => {
       return new Promise<string>(resolve => { complete = resolve; });
     });
     await announceTransport(sessionId, 'Wrapping up');
-    await vi.waitFor(() => expect(complete).toBeTypeOf('function'));
+    await vi.waitFor(() => expect(complete).toBeTypeOf('function'), WAIT);
     try {
       expect(getSessionFinishDraft(sessionId, 'turn-one')?.stage).toBe('sending');
       expect(getSessionFinishDraft('another-session', 'turn-one')).toBeNull();
@@ -107,7 +112,7 @@ describe('session finish turn identity', () => {
     let fail!: (error: Error) => void;
     hooks.followup.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject; }));
     await announceTransport(sessionId, 'Wrapping up');
-    await vi.waitFor(() => expect(fail).toBeTypeOf('function'));
+    await vi.waitFor(() => expect(fail).toBeTypeOf('function'), WAIT);
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
       fail(new TaskRequestError('http_503: busy', true));
@@ -129,7 +134,7 @@ describe('session finish turn identity', () => {
     let settled = false;
     const call = announceTransport(sessionId, 'Ready', sessionFinishDeadline(ingress)).then(value => { settled = true; return value; });
     try {
-      await vi.waitFor(() => expect(hooks.followup).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(hooks.followup).toHaveBeenCalledTimes(1), WAIT);
       await vi.advanceTimersByTimeAsync(1_000);
       expect(settled).toBe(true);
       expect(await call).toContain('HELD:');
@@ -143,7 +148,7 @@ describe('session finish turn identity', () => {
     let fail!: (error: Error) => void;
     hooks.followup.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject; }));
     await announceTransport(sessionId, 'Ready');
-    await vi.waitFor(() => expect(fail).toBeTypeOf('function'));
+    await vi.waitFor(() => expect(fail).toBeTypeOf('function'), WAIT);
     vi.useFakeTimers();
     fail(new TaskRequestError('rate_limited: busy', true));
     await vi.advanceTimersByTimeAsync(0);
@@ -157,7 +162,7 @@ describe('session finish turn identity', () => {
     expect(hooks.followup).toHaveBeenCalledTimes(2);
     expect(hooks.enqueue).toHaveBeenCalledTimes(1);
     expect(hooks.enqueue).toHaveBeenCalledWith(expect.objectContaining({ sessionId, mode: 'auto', text: 'Check the remaining requirement' }),
-      { turnId: 'turn-one', periodic: false });
+      { turnId: 'turn-one', periodic: false, mode: 'goal' });
     await announceSessionFinish(sessionId, 'Again');
     expect(hooks.followup).toHaveBeenCalledTimes(2);
   });
@@ -165,7 +170,7 @@ describe('session finish turn identity', () => {
     let fail!: (error: Error) => void;
     hooks.followup.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject; }));
     await announceTransport(sessionId, 'Ready');
-    await vi.waitFor(() => expect(fail).toBeTypeOf('function'));
+    await vi.waitFor(() => expect(fail).toBeTypeOf('function'), WAIT);
     vi.useFakeTimers();
     fail(new TaskRequestError('http_503: busy', true));
     await vi.advanceTimersByTimeAsync(0);
@@ -179,15 +184,48 @@ describe('session finish turn identity', () => {
     expect(hooks.enqueue).not.toHaveBeenCalled();
     expect(hooks.inputListeners.size).toBe(0);
   });
-  it('uses the armed Astra switch as Loop at finish and suppresses Notify', async () => {
+  it.each(['goal', 'loop'] as const)('uses the selected Astra %s mode at finish and suppresses Notify', async mode => {
     await observeSessionModel(sessionId, hooks.caller.conversationId, 'gpt-6-pro', Date.now());
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, finishTool: true, finishAction: 'notify' } });
     const { setGoalSwitchNow } = await import('../src/main/goal.js');
-    await setGoalSwitchNow(hooks.caller.conversationId, 'goal', true);
+    await setGoalSwitchNow(hooks.caller.conversationId, mode, true);
     await announceSessionFinish(sessionId, 'Wrapping up');
-    expect(hooks.followup.mock.calls.map(call => call[4])).toEqual(['loop']);
+    expect(hooks.followup.mock.calls.map(call => call[4])).toEqual([mode]);
     expect(notify).not.toHaveBeenCalled();
-    expect(hooks.enqueue).toHaveBeenCalledWith(expect.objectContaining({ mode: 'auto' }), { turnId: 'turn-one', periodic: false });
+    expect(hooks.enqueue).toHaveBeenCalledWith(expect.objectContaining({ mode: 'auto' }), { turnId: 'turn-one', periodic: false, mode });
+  });
+  it('releases the exact finish hold when Goal completes without fabricating a final or a queued instruction', async () => {
+    hooks.hasInput = false;
+    hooks.followup.mockResolvedValueOnce(null);
+    await setGoalSwitchNow(hooks.caller.conversationId, 'goal', true);
+    expect(await announceSessionFinish(sessionId, 'Requested work is complete')).toContain('RELEASED:');
+    expect(hooks.followup).toHaveBeenCalledOnce();
+    expect(hooks.enqueue).not.toHaveBeenCalled();
+    expect((await getSession(sessionId))?.finishTurn?.released).toBe(true);
+    expect((await getSession(sessionId))?.activeTurnId).toBe('turn-one');
+    expect(await readRecentEvents(sessionId, 10, { kinds: ['turn_end'] })).toEqual([]);
+    await announceSessionFinish(sessionId, 'Repeated finish');
+    expect(hooks.followup).toHaveBeenCalledOnce();
+  });
+  it.each(['goal', 'loop'] as const)('revokes an in-flight %s decision across a mode switch and switch back', async mode => {
+    await setGoalSwitchNow(hooks.caller.conversationId, mode, true);
+    let complete!: (text: string) => void;
+    let signal!: AbortSignal;
+    hooks.followup.mockImplementationOnce((_id, currentSignal) => {
+      signal = currentSignal;
+      return new Promise<string>(resolve => { complete = resolve; });
+    });
+    await announceTransport(sessionId, 'Wrapping up');
+    await vi.waitFor(() => expect(complete).toBeTypeOf('function'), WAIT);
+    try {
+      await setGoalSwitchNow(hooks.caller.conversationId, mode === 'goal' ? 'loop' : 'goal', true);
+      const revoked = signal.aborted;
+      await setGoalSwitchNow(hooks.caller.conversationId, mode, true);
+      complete('Obsolete mode decision');
+      await settleSessionFinishForTests();
+      expect(revoked).toBe(true);
+      expect(hooks.enqueue).not.toHaveBeenCalled();
+    } finally { complete('Release the fixture'); await settleSessionFinishForTests(); }
   });
   it.each(['auto', 'finish', 'after-turn'])('suppresses notices and decisions while %s input remains queued, including future schedules', async mode => {
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, finishTool: true, finishAction: 'notify' } });
@@ -206,14 +244,14 @@ describe('session finish turn identity', () => {
     await expect(requestSessionFinishGoal(sessionId, 'turn-one')).rejects.toThrow('expired');
     hooks.hasInput = false;
     const waiting = announceTransport(sessionId, 'Wait for user input');
-    await vi.waitFor(() => expect(hooks.inputListeners.size).toBe(1));
+    await vi.waitFor(() => expect(hooks.inputListeners.size).toBe(1), WAIT);
     expect(await sessionFinishWaiting(sessionId, 'turn-one', hooks.caller.conversationId)).toBe(true);
     hooks.delivered.push({ id: 'user-priority', sessionId, text: 'First do this', state: 'queued' });
     expect(await sessionFinishWaiting(sessionId, 'turn-one', hooks.caller.conversationId)).toBe(false);
     await expect(requestSessionFinishGoal(sessionId, 'turn-one')).rejects.toThrow('already queued');
     hooks.delivered = [];
     await requestSessionFinishGoal(sessionId, 'turn-one');
-    expect(hooks.enqueue).toHaveBeenCalledWith(expect.objectContaining({ sessionId }), { turnId: 'turn-one', periodic: false, userRequested: true });
+    expect(hooks.enqueue).toHaveBeenCalledWith(expect.objectContaining({ sessionId }), { turnId: 'turn-one', periodic: false, mode: 'goal', userRequested: true });
     await releaseSessionFinish(sessionId, 'turn-one');
     await waiting;
     expect(await sessionFinishWaiting(sessionId, 'turn-one', hooks.caller.conversationId)).toBe(false);
@@ -225,7 +263,7 @@ describe('session finish turn identity', () => {
     let action: Promise<string> | undefined;
     notify.mockImplementationOnce(() => { action = requestSessionFinishGoal(sessionId, 'turn-one'); return true; });
     const call = announceTransport(sessionId, 'Ready');
-    await vi.waitFor(() => expect(action).toBeDefined());
+    await vi.waitFor(() => expect(action).toBeDefined(), WAIT);
     await action;
     expect(hooks.followup).toHaveBeenCalledTimes(1);
     expect(hooks.enqueue).toHaveBeenCalledTimes(1);
@@ -240,7 +278,7 @@ describe('session finish turn identity', () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
       const call = announceTransport(sessionId, 'Ready');
-      await vi.waitFor(() => expect(hooks.followup).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(hooks.followup).toHaveBeenCalledTimes(1), WAIT);
       await vi.advanceTimersByTimeAsync(25000);
       expect(await call).toContain('later tool call');
       expect(hooks.enqueue).not.toHaveBeenCalled();
@@ -350,7 +388,7 @@ describe('session finish turn identity', () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
       const result = announceSessionFinish(sessionId, 'Waiting');
-      await vi.waitFor(() => expect(hooks.inputListeners.size).toBe(1));
+      await vi.waitFor(() => expect(hooks.inputListeners.size).toBe(1), WAIT);
       await vi.advanceTimersByTimeAsync(25000);
       expect(await result).toContain('HELD:');
       expect(hooks.followup).toHaveBeenCalledTimes(1);
@@ -362,7 +400,7 @@ describe('session finish turn identity', () => {
   it('waits for input without consuming it and keeps the same turn held', async () => {
     hooks.hasInput = false;
     const result = announceSessionFinish(sessionId, 'Waiting');
-    await vi.waitFor(() => expect(hooks.inputListeners.size).toBe(1));
+    await vi.waitFor(() => expect(hooks.inputListeners.size).toBe(1), WAIT);
     hooks.hasInput = true;
     for (const listener of hooks.inputListeners) listener();
     expect(await result).toContain('HELD:');
@@ -379,11 +417,11 @@ describe('session finish turn identity', () => {
     hooks.hasInput = false;
     const released = vi.fn();
     const result = announceSessionFinish(sessionId, 'Waiting').then(value => { released(); return value; });
-    await vi.waitFor(() => expect(hooks.inputListeners.size).toBe(1));
+    await vi.waitFor(() => expect(hooks.inputListeners.size).toBe(1), WAIT);
     await releaseSessionFinish(sessionId, 'turn-one');
     // A real recorder notification must wake this call; the 25-second transport
     // deadline used to mask a leaked fake notification timer from an earlier test.
-    await vi.waitFor(() => expect(released).toHaveBeenCalledOnce(), { timeout: 2000 });
+    await vi.waitFor(() => expect(released).toHaveBeenCalledOnce(), WAIT);
     expect(await result).toContain('RELEASED:');
     await flushSessions(); resetSessionStoreForTests(); initSessionStore(directory);
     expect(await sessionFinishHeld(sessionId, 'turn-one', hooks.caller.conversationId)).toBe(false);
@@ -404,6 +442,37 @@ describe('session finish turn identity', () => {
     expect(identities.has('finish:turn-one')).toBe(false);
     expect([...identities].filter(id => id?.startsWith('finish-goal:turn-one:'))).toHaveLength(1);
   });
+  it('decides again after a delivered continuation was worked through with tools only (#558)', async () => {
+    // Live report: after one automatic Goal continuation the executor worked only through MCP,
+    // and every later session_finish answered "context is unchanged" and held the turn forever.
+    const recordTool = (tool: string, time: number, result = 'ok') => appendEvent(sessionId, {
+      source: 'mcp', kind: 'tool_call', turnId: 'turn-one', time,
+      call: { callId: randomUUID(), tool, attribution: 'request_id', requestId: `r-${time}`, conversationId: hooks.caller.conversationId,
+        attributionMethod: 'request_id', args: { text: '{"cmd":"PRIVATE_ARGUMENT"}', chars: 26, truncated: false },
+        result: { text: `PRIVATE_RESULT ${result}`, chars: 20, truncated: false }, outcome: 'ok', durationMs: 1,
+        summary: { title: tool, tone: 'neutral', kind: 'other' } }
+    });
+    await appendEvent(sessionId, { source: 'extension', kind: 'user_message', time: 1100, messageId: 'u-558', message: { text: 'Audit the project', chars: 17, truncated: false } });
+    await appendEvent(sessionId, { source: 'extension', kind: 'assistant_message', turnId: 'turn-one', time: 1200, messageId: 'a-558', final: false,
+      message: { text: 'Auditing the project now.', chars: 25, truncated: false } });
+    await recordTool('exec_command', 1300);
+    await announceSessionFinish(sessionId, 'First pass done');
+    expect(hooks.followup).toHaveBeenCalledTimes(1);
+    await recordTool('session_finish', 2100, 'HELD');
+    await announceSessionFinish(sessionId, 'Waiting for the continuation');
+    expect(hooks.followup).toHaveBeenCalledTimes(1);
+    // The continuation arrives through the tool outbox and is worked through with tools only.
+    await recordTool('exec_command', 2300);
+    await recordTool('apply_patch', 2400);
+    await announceSessionFinish(sessionId, 'Second pass done');
+    expect(hooks.followup).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(hooks.followup.mock.calls[1]?.[2])).not.toMatch(/PRIVATE_|exec_command|apply_patch/);
+    // Hold calls alone are still not work.
+    await recordTool('session_finish', 2600, 'HELD');
+    await announceSessionFinish(sessionId, 'Empty wait');
+    expect(hooks.followup).toHaveBeenCalledTimes(2);
+  });
+
   it('does not repeat for tool-only work even with legacy opt-in, but reconsiders delivered app input', async () => {
     const recordTool = (tool: string, result: string) => appendEvent(sessionId, {
       source: 'mcp', kind: 'tool_call', turnId: 'turn-one', time: 2200,
@@ -480,5 +549,57 @@ describe('session finish turn identity', () => {
     const result = await announceSessionFinish(sessionId, 'Wrapping up');
     expect(JSON.stringify(await readRecentEvents(sessionId, 100, { kinds: ['progress'] }))).toContain('discarded');
     expect(result).not.toContain('Stale follow-up must not escape');
+  });
+  it('releases the hold without asking the provider while this chat’s own sub-agents are still working', async () => {
+    const previous = getConfig();
+    try {
+      // The chat's workers report back into this same chat, so deciding the next step now would
+      // read a context that is about to change. The hold is released rather than left held: the
+      // answer may finish, and the reply obligation the pickup tree already tracks is what the
+      // next automatic step will be decided from.
+      await saveConfig({ ...previous, multiAgent: { ...previous.multiAgent, enabled: true, waitForSubAgents: true } });
+      spawn({ workers: [{ task: 'finish the half I cannot' }], caller: { conversationId: hooks.caller.conversationId } });
+      expect(bindConversation('worker-1', 'finish-wait-worker')).toBe(true);
+      expect(waitingForSubAgents(hooks.caller.conversationId)).toBe(true);
+
+      // The model is told the turn stays open; the provider is never asked and nothing is
+      // queued. `announceSessionFinish` returns that hold and `settleFinishForTests` drains the
+      // automatic operation, so the side effects below are the whole decision.
+      expect(await announceSessionFinish(sessionId, 'Handing the rest to my workers')).toContain('HELD:');
+      expect(hooks.followup).not.toHaveBeenCalled();
+      expect(hooks.enqueue).not.toHaveBeenCalled();
+      expect((await getSession(sessionId))?.finishTurn?.released).toBe(true);
+      expect(JSON.stringify(await readRecentEvents(sessionId, 100, { kinds: ['progress'] }))).not.toContain('finish-goal:');
+    } finally { await saveConfig(previous); resetAgentsForTests(); }
+  });
+  it('decides as usual once the last sub-agent has reported', async () => {
+    const previous = getConfig();
+    try {
+      await saveConfig({ ...previous, multiAgent: { ...previous.multiAgent, enabled: true, waitForSubAgents: true } });
+      spawn({ workers: [{ task: 'finish the half I cannot' }], caller: { conversationId: hooks.caller.conversationId } });
+      expect(bindConversation('worker-1', 'finish-wait-worker')).toBe(true);
+      finishAgent({ conversationId: 'finish-wait-worker' }, 'both halves are done');
+      expect(waitingForSubAgents(hooks.caller.conversationId)).toBe(false);
+
+      await announceSessionFinish(sessionId, 'Everything is done');
+      expect(hooks.followup).toHaveBeenCalledTimes(1);
+      expect(hooks.enqueue).toHaveBeenCalledWith(expect.objectContaining({ mode: 'auto' }), expect.anything());
+      expect((await getSession(sessionId))?.finishTurn?.released).toBe(false);
+    } finally { await saveConfig(previous); resetAgentsForTests(); }
+  });
+  it('never holds a notice-only finish on a chat with busy sub-agents', async () => {
+    const previous = getConfig();
+    try {
+      await saveConfig({ ...previous, ui: { ...previous.ui, finishAction: 'notify' }, goal: { ...previous.goal, enabled: false },
+        multiAgent: { ...previous.multiAgent, enabled: true, waitForSubAgents: true } });
+      spawn({ workers: [{ task: 'keep the chat busy' }], caller: { conversationId: hooks.caller.conversationId } });
+      expect(bindConversation('worker-1', 'finish-notice-worker')).toBe(true);
+
+      const result = await announceSessionFinish(sessionId, 'Wrapping up with no automation');
+      expect(result).not.toContain('sub-agents');
+      expect(hooks.followup).not.toHaveBeenCalled();
+      expect(notify).toHaveBeenCalledTimes(1);
+      expect((await getSession(sessionId))?.finishTurn?.released).toBe(false);
+    } finally { await saveConfig(previous); resetAgentsForTests(); }
   });
 });

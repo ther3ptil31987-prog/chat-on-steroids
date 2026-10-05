@@ -22,8 +22,12 @@ describe('portable browser-backed feature parity', () => {
       expect(config.multiAgent).toEqual({
         enabled: true,
         maxWorkers: 2,
+        globalMaxWorkers: 0,
         allowUnattributedCalls: true,
-        recoverAgentTabs: false
+        strictChatAllowlist: false,
+        recoverAgentTabs: false,
+        waitForSubAgents: false,
+        endSleepingWorkerProcesses: false
       });
       expect(browserExtensionRequired(config)).toBe(true);
     }
@@ -62,6 +66,7 @@ describe('portable browser-backed feature parity', () => {
       'view_image',
       'find',
       'apply_patch',
+      'save_image',
       'exec_command',
       'write_stdin',
       'update_plan',

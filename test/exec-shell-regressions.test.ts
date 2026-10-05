@@ -1,10 +1,10 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { bindBundledRipgrep, execRecoveryHints, nonZeroExitIsBenign, repairPowerShellQuoting } from '../src/main/exec-hints.js';
-import { deriveExecArgs, getShellByModelProvidedPath } from '../src/main/codex/shell.js';
+import { deriveExecArgs, getShellByModelProvidedPath, withPosixPathPrefix } from '../src/main/codex/shell.js';
 import { composeCommandBatch, parseCommandBatchSections } from '../src/main/codex/command-batch.js';
 import { locateRipgrep } from '../src/main/ripgrep.js';
 
@@ -18,12 +18,27 @@ function fixture() {
   return dir;
 }
 
+/**
+ * Whether a ripgrep exists for these cases to run at all.
+ *
+ * They execute the real binary, bound by `bindBundledRipgrep`, which needs one: the copy under
+ * `resources/rg` that packaging prepares, or one on PATH. A checkout that has not run that
+ * preparation and a host with no system ripgrep have neither, and then every one of these fails
+ * with `Command failed: /bin/sh -c rg …` — a missing tool reported as a quoting regression.
+ * Measured on macOS 27 from a fresh worktree, and reported from a Windows machine as the
+ * "bundled-rg shell-path assertion" failing identically on unmodified `main`.
+ *
+ * The parity these cases assert is about argument handling, not about shipping ripgrep, so the
+ * honest answer without one is to skip and say so — the same shape as the `!shell` guard below.
+ */
+const ripgrep = locateRipgrep();
+
 describe('native shell argument and batch parity', () => {
   // Every installed shell runs real child processes. macOS CI includes zsh; Linux
   // includes bash/sh. Windows exercises both PS generations when installed.
   for (const name of process.platform === 'win32' ? ['powershell', 'pwsh'] : ['bash', 'zsh', 'sh']) {
     const shell = getShellByModelProvidedPath(name);
-    it.skipIf(!shell)(`${name}: preserves quotes followed by spaces and adjacent paths`, () => {
+    it.skipIf(!shell || !ripgrep)(`${name}: preserves quotes followed by spaces and adjacent paths`, () => {
       const cwd = fixture();
       const original = String.raw`rg -n "history=\"older\"|Load older" sample.txt second.txt`;
       const repaired = repairPowerShellQuoting(original, shell!.shellType);
@@ -42,6 +57,25 @@ describe('native shell argument and batch parity', () => {
 });
 
 const zsh = getShellByModelProvidedPath('zsh');
+it.skipIf(!zsh)('restores bundled command discovery after a login profile rewrites PATH', () => {
+  const dir = fixture();
+  const bundled = join(dir, "app's bundled tools");
+  mkdirSync(bundled);
+  writeFileSync(join(bundled, 'rg'), '#!/bin/sh\nprintf bundled-rg\n', { mode: 0o755 });
+  writeFileSync(join(dir, '.zprofile'), 'export PATH=/usr/bin:/bin\n');
+  const command = withPosixPathPrefix('command -v rg; rg; printf "\\n%s" "$PATH"', 'zsh', bundled);
+  const args = deriveExecArgs(zsh!, command, true);
+  const result = spawnSync(args[0]!, args.slice(1), { encoding: 'utf8', env: { ...process.env, ZDOTDIR: dir } });
+  expect(result.status).toBe(0);
+  expect(result.stdout.trim().split('\n')).toEqual([join(bundled, 'rg'), 'bundled-rg', `${bundled}:/usr/bin:/bin`]);
+});
+
+it('leaves other shell languages and missing bundled paths unchanged', () => {
+  expect(withPosixPathPrefix('Get-Command rg', 'powershell', '/bundle')).toBe('Get-Command rg');
+  expect(withPosixPathPrefix('where rg', 'cmd', '/bundle')).toBe('where rg');
+  expect(withPosixPathPrefix('command -v rg', 'sh', null)).toBe('command -v rg');
+});
+
 it.skipIf(!zsh)('preserves native zsh unmatched-glob failure instead of reporting no search matches', () => {
   const command = bindBundledRipgrep('rg needle missing/*.ts', 'zsh', locateRipgrep());
   const args = deriveExecArgs(zsh!, command, false);

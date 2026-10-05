@@ -3,6 +3,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { pluginManager } from './plugins/manager.js';
 import { refreshPluginPublication } from './connection.js';
+import { rearmPluginRefresh } from './plugin-refresh.js';
 
 const values = z.record(z.string().min(1).max(128), z.string().max(16_384)).refine(value => Object.keys(value).length <= 64, 'At most 64 configuration fields');
 const source = z.object({
@@ -18,7 +19,11 @@ const identity = z.object({ id: z.string().min(1).max(80) });
 type Register = <T>(channel: string, fn: (payload: unknown) => Promise<T>) => void;
 
 /** Named, validated operations; credentials cross IPC only toward encrypted storage. */
-export function registerPluginIpc(handle: Register, getWindow: () => BrowserWindow | null): void {
+export function registerPluginIpc(
+  handle: Register,
+  getWindow: () => BrowserWindow | null,
+  publishStateChange: () => void
+): void {
   handle('plugins:legalNotices', async () => {
     const error = await shell.openPath(path.join(app.isPackaged ? process.resourcesPath : app.getAppPath(), 'THIRD-PARTY-NOTICES.txt'));
     if (error) throw new Error('Could not open the bundled Third-party Notices file.');
@@ -30,7 +35,9 @@ export function registerPluginIpc(handle: Register, getWindow: () => BrowserWind
     await pluginManager.configure(input.id, input.patch); return pluginManager.snapshot();
   });
   for (const action of ['restart', 'update', 'uninstall', 'authenticate', 'cancelAuthentication'] as const) handle(`plugins:${action}`, async payload => {
-    await pluginManager[action](identity.strict().parse(payload).id); return pluginManager.snapshot();
+    await pluginManager[action](identity.strict().parse(payload).id);
+    if (action === 'restart') await rearmPluginRefresh('plugins');
+    return pluginManager.snapshot();
   });
   handle('plugins:enabled', async payload => {
     const input = identity.extend({ enabled: z.boolean() }).strict().parse(payload);
@@ -48,5 +55,8 @@ export function registerPluginIpc(handle: Register, getWindow: () => BrowserWind
     refreshPluginPublication('plugins');
     const window = getWindow();
     if (window && !window.isDestroyed()) window.webContents.send('plugins:changed', pluginManager.snapshot());
+    // The plugin snapshot repaints the Plugins panel, while AppState carries the exact
+    // connector schema fingerprint used by the global ChatGPT-refresh reminder.
+    publishStateChange();
   });
 }

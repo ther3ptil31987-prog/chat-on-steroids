@@ -4,23 +4,27 @@ const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const root = path.resolve(__dirname, '..');
-const output = path.join(root, '.tmp/message-send-20260918/ui');
+const { fixtureConfigSource, BENIGN_RENDERER_ERRORS } = require('./fixtures/app-defaults.cjs');
+// The first plain argument; switches such as verify-ui's --lang=en-US are not an output folder.
+const outputArg = process.argv.slice(2).find(arg => !arg.startsWith('--'));
+const output = outputArg ? path.resolve(root, outputArg) : path.join(root, '.tmp/message-send-20260918/ui');
 app.setPath('userData', path.join(output, 'runtime'));
 
 app.whenReady().then(async () => {
   const { createServer } = await import('vite');
   const fixture = `
-    addEventListener('error', event => window.fixtureError = event.message);
+    addEventListener('error', event => { if (!${JSON.stringify(BENIGN_RENDERER_ERRORS)}.includes(event.message)) window.fixtureError = event.message; });
     addEventListener('unhandledrejection', event => window.fixtureError = String(event.reason?.stack ?? event.reason));
     const ok = data => Promise.resolve({ok:true,data});
-    const config = {
+    ${fixtureConfigSource()}
+    const config = fixtureConfig({
       roots:[{name:'fixture',path:'C:/fixture'}],readOnly:true,capabilities:{browse:true,search:true,read:true,metadata:true},
       tunnel:{kind:'openai',tunnelId:'',desktopTunnelId:'',binaryPath:''},
       ui:{theme:'dark',autoConnect:false,minimizeToTray:true,privacyScreenshots:false},
       sessions:{record:true,retainDays:30,advisoryTokens:300000,limitTokens:400000},
       compaction:{auto:false,autoTokens:300000},multiAgent:{enabled:false,maxWorkers:2},
       goal:{enabled:false,model:'fixture',reasoning:'default',prompt:'Fixture'}
-    };
+    });
     const state={config,hasApiKey:false,hasGoalKey:false,resolvedBinary:null,bundledTunnelVersion:null,
       status:{state:'disconnected',detail:'',publicUrl:null,localUrl:null,health:null,surfaces:[]},
       bridge:{running:false,paired:false,present:false,port:0},update:{current:'fixture',stage:'idle'}};
@@ -29,17 +33,19 @@ app.whenReady().then(async () => {
       startedAt:1,updatedAt:1,endedAt:null,events:0,userMessages:0,toolCalls:0,lastToolCallAt:null,
       processExitNonzero:0,toolRejected:0,toolInternalErrors:0,errors:0,estimatedTokens:0,contextTokens:0,
       lastHandoffId:null,lastHandoffAt:null,lastTurnOutcome:null,activeTurnId:'fixture-turn',agents:[],origin:null};
-    window.queueFixture={inputs:[],sent:[],files:[],session,controls:{}};
+    window.queueFixture={inputs:[],sent:[],stops:[],files:[],events:[],session,controls:{}};
     const live=window.queueFixture;
     window.api=new Proxy({
       getState:()=>ok(state),getLog:()=>ok([]),listProjects:()=>ok([]),
       getSwarm:()=>ok({running:false,agents:[],maxWorkers:2,pendingReports:0}),
       listSessions:()=>ok({sessions:[session],activeId:null,pressure:[]}),
-      getSession:()=>ok({summary:session,events:[],total:0,nextFrom:0}),
+      getSession:(_id,options={})=>ok({summary:session,events:live.events.filter(event=>event.seq>=(options.from??0)),
+        total:live.events.length,nextFrom:(live.events.at(-1)?.seq??-1)+1}),
       getSessionControls:()=>ok({sessionId:session.id,activeTurnId:'fixture-turn',canInject:true,automation:'off',objective:'',...live.controls}),
       getChatModels:()=>ok({state:'ready',observedAt:Date.now(),models:[{id:'gpt-5.6-sol',label:'GPT-5.6 Sol',efforts:['high']}]}),
-      listInputs:()=>ok(structuredClone(live.inputs)),listPausedHelpers:()=>ok([]),
+      listInputs:()=>ok(structuredClone(live.inputs)),runningTools:()=>ok([]),listPausedHelpers:()=>ok([]),
       onSessionChanged:fn=>{live.notify=fn;return ()=>{}},chooseFiles:()=>ok(live.files),
+      stopSessionTurn:(id,turnId)=>{live.stops.push({id,turnId});return ok({})},
       editQueuedInput:(id,text)=>{const row=live.inputs.find(r=>r.id===id);if(!row||row.state!=='queued')return ok(false);row.text=text.trim();return ok(true)},
       cancelInput:id=>{const row=live.inputs.find(r=>r.id===id);if(!row)return ok(false);row.state='cancelled';return ok(true)},
       sendInput:input=>{live.sent.push(input);const row={...input,state:'queued',owner:null,createdAt:Date.now(),conversationId:session.conversationId};live.inputs.push(row);return ok(row)}
@@ -66,12 +72,36 @@ app.whenReady().then(async () => {
         if (await js(condition)) return;
         await new Promise(resolve => setTimeout(resolve, 25));
       }
-      throw new Error('Renderer condition timed out: ' + condition + ' ' + JSON.stringify(await js('({ready:!!window.fixtureReady,error:window.fixtureError})')));
+      throw new Error('Renderer condition timed out: ' + condition + ' ' + JSON.stringify(await js('({ready:!!window.fixtureReady,error:window.fixtureError,keys:window.fixtureKeys,focused:document.activeElement?.id,stops:window.queueFixture?.stops})')));
     };
     const click = selector => js(`document.querySelector(${JSON.stringify(selector)}).click()`);
     const checks = [];
     await wait('window.fixtureReady && !!document.querySelector("#sessionList [data-id]")');
     await click('#sessionList [data-id]');
+    await wait('document.getElementById("chatSend").dataset.action === "stop"');
+    await js('document.getElementById("composer").requestSubmit()');
+    await js('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+    assert.equal(await js('queueFixture.stops.length'), 0);
+    checks.push('empty native form submit does not request Stop');
+    await js(`(() => {
+      const input=document.getElementById('chatInput'),form=document.getElementById('composer');
+      input.value='One correction';input.dispatchEvent(new Event('input',{bubbles:true}));
+      form.requestSubmit();form.requestSubmit();
+    })()`);
+    await wait('queueFixture.sent.length === 1 && document.getElementById("chatSend").dataset.action === "stop"');
+    assert.equal(await js('queueFixture.stops.length'), 0);
+    checks.push('repeated submit sends one correction without stopping');
+    await click('#chatSend');
+    await wait('queueFixture.stops.length === 1');
+    assert.deepEqual(await js('queueFixture.stops[0]'), {id:'queue-fixture-session',turnId:'fixture-turn'});
+    await wait('document.getElementById("chatSend").getAttribute("aria-label") === "Stop turn"');
+    await js(`window.fixtureKeys=[];document.addEventListener('keydown',e=>fixtureKeys.push({key:e.key,target:e.target.id}),true);
+      document.getElementById('chatSend').focus()`);
+    win.webContents.sendInputEvent({type:'keyDown',keyCode:'Return'});
+    win.webContents.sendInputEvent({type:'char',keyCode:'\r'});
+    win.webContents.sendInputEvent({type:'keyUp',keyCode:'Return'});
+    await wait('queueFixture.stops.length === 2');
+    checks.push('button and keyboard activation stop only the captured turn');
     const seed = async () => {
       await js(`queueFixture.inputs=[{id:'editable-task',sessionId:queueFixture.session.id,text:'Review the attached screenshots',mode:'after-turn',dueAt:0,
         state:'queued',owner:null,createdAt:0,conversationId:'fixture-chat',model:null,reasoningEffort:null}];queueFixture.notify()`);
@@ -151,6 +181,38 @@ app.whenReady().then(async () => {
     assert.equal(await js('queueFixture.inputs[0].state'), 'cancelled'); checks.push('automatic Continue remains cancellable');
     await js('queueFixture.controls={};queueFixture.notify()');
     await wait('document.getElementById("recoveryStatus").hidden && document.getElementById("goalLifecycle").hidden');
+    await js(`(() => {
+      const start=Date.now()-240_000;
+      queueFixture.events=Array.from({length:4},(_,i)=>({seq:i+1,time:start+i*60_000,source:'extension',kind:'user_message',
+        messageId:'question-'+i,message:{text:'Recorded task '+(i+1),chars:15,truncated:false}}));
+      queueFixture.session.events=4;queueFixture.session.updatedAt=Date.now();
+      queueFixture.inputs=Array.from({length:3},(_,i)=>({id:'cancelled-continue-'+i,sessionId:queueFixture.session.id,
+        text:'Continue the task after this interrupted response.',mode:'after-turn',dueAt:0,state:'cancelled',owner:null,
+        createdAt:start+i*60_000+10_000,conversationId:'previous-chat-'+i,model:null,reasoningEffort:null,
+        error:'Automatic Continue cancelled: the source received new work.',
+        recovery:{questionId:'question-'+i,pro:false,busyUntil:start+i*60_000+70_000,phase:'ready'}}));
+      queueFixture.notify();
+    })()`);
+    await wait('document.querySelectorAll("#timeline [data-input-id^=\\"cancelled-continue-\\"]").length===3');
+    for (const width of [1100,640]) {
+      win.setSize(width,1000);
+      await js('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+      const history=await js(`(() => {
+        const timeline=document.getElementById('timeline'),content=timeline.textContent;
+        const order=Array.from({length:3},(_,i)=>{
+          const card=timeline.querySelector('[data-input-id="cancelled-continue-'+i+'"]');
+          const before=content.indexOf('Recorded task '+(i+1)),at=content.indexOf(card.textContent),after=content.indexOf('Recorded task '+(i+2));
+          return !!card.querySelector('time')&&before<at&&at<after;
+        });
+        return {order,bottomCards:document.querySelectorAll('#inputQueue [data-input-id^="cancelled-continue-"]').length,
+          dates:[...timeline.querySelectorAll('[data-input-id^="cancelled-continue-"] time')].map(time=>time.textContent),error:window.fixtureError||null};
+      })()`);
+      assert.deepEqual(history.order,[true,true,true]);assert.equal(history.bottomCards,0);assert.equal(history.error,null);
+      await win.webContents.capturePage(undefined,{stayHidden:true,stayAwake:true});
+      await new Promise(resolve=>setTimeout(resolve,150));
+      fs.writeFileSync(path.join(output,'cancelled-history-'+width+'.png'),(await win.webContents.capturePage(undefined,{stayHidden:true,stayAwake:true})).toPNG());
+      checks.push({historyWidth:width,...history});
+    }
     for (const count of [7, 10]) {
       await js(`queueFixture.files=Array.from({length:${count}},(_,i)=>({id:'image-'+i,name:'reference-'+i+'.png',mimeType:'image/png',size:42}))`);
       await click('#attachImages');

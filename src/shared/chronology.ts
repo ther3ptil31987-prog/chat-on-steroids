@@ -40,6 +40,7 @@ export interface Chronological {
   inputId?: string;
   kind: string;
   source?: string;
+  agent?: string;
   call?: { requestId?: string | null; conversationId?: string | null; attribution?: string };
   turnId?: string | null;
   /** ChatGPT's own terminal flag for the one message that ended a turn. See `closing()`. */
@@ -161,12 +162,46 @@ export function authoredTimeOf(entry: Chronological): number | undefined {
   return id && (id[1] || id[2]) ? Number(id[3]) : undefined;
 }
 
+/** Both canonical formats retain the native response's working/exchange UUIDs.
+ * The parent or creation stamp identifies a message inside it, not another response. */
+function assistantResponseKey(entry: Chronological): string | undefined {
+  if (entry.kind !== 'assistant_message' || entry.source !== 'extension') return undefined;
+  const parts = entry.messageId?.split(':');
+  if (parts?.length !== 4 || parts[0] !== 'assistant') return undefined;
+  const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+  const timestamped = /^\d{13}$/.test(parts[3]!);
+  if (!timestamped && !uuid.test(parts[1]!)) return undefined;
+  const working = parts[timestamped ? 1 : 2]!, exchange = parts[timestamped ? 2 : 3]!;
+  if (!uuid.test(working) || !uuid.test(exchange)) return undefined;
+  return `${entry.agent ?? ''}\u0000${working.toLowerCase()}:${exchange.toLowerCase()}`;
+}
+
 /** Attach the session's recorded boundaries before selecting/rendering a small page.
  * These fields affect presentation only; seq, origin, time and turnId stay untouched. */
-export function projectTimeline<T extends Chronological>(entries: readonly T[], turns: TimelineTurns = {}, requests: RequestTurns = {}): T[] {
+export function projectTimeline<T extends Chronological>(
+  entries: readonly T[], turns: TimelineTurns = {}, requests: RequestTurns = {},
+  messages: Iterable<Chronological> = entries
+): T[] {
   const starts = Object.values(turns).sort((a, b) => a.origin - b.origin);
+  // Reload can lose the document-local owner of later public prose. An earlier
+  // canonical message of that exact native response still proves its display group.
+  // Resolve from all canonical messages, including anchors/conflicts outside this
+  // page. This neither coalesces sibling messages nor grants a lifecycle turnId.
+  const responses = new Map<string, TimelineTurns[string] | null>();
+  for (const message of messages) {
+    if (!message.turnId) continue;
+    const key = assistantResponseKey(message);
+    if (!key) continue;
+    const boundary = turns[responseTurnId(turns, message.turnId)] ?? null;
+    if (!responses.has(key)) responses.set(key, boundary);
+    else if (!boundary || responses.get(key)?.origin !== boundary.origin) responses.set(key, null);
+  }
   return entries.map(entry => {
     let boundary = entry.turnId ? turns[responseTurnId(turns, entry.turnId)] : undefined;
+    if (!entry.turnId) {
+      const response = assistantResponseKey(entry);
+      if (response) boundary = responses.get(response) ?? undefined;
+    }
     // Older recorders dropped the local turn after its end. Its earlier exact request
     // proof still places the call, including when that proof lies outside this page.
     const requestOwner = !entry.turnId && entry.kind === 'tool_call' && entry.source === 'mcp' && entry.call?.attribution === 'request_id'
@@ -185,6 +220,11 @@ export function projectTimeline<T extends Chronological>(entries: readonly T[], 
     return { ...entry, turnOrigin: boundary?.origin ?? null, ...(authoredAt !== undefined ? { authoredAt } : {}) };
   });
 }
+
+/** Entries recorded from one read of the page land within this many milliseconds of each other. */
+const SAME_READ_MS = 50;
+/** A call ChatGPT issued reaches this app through the tunnel within this many milliseconds. */
+const CALL_TRANSIT_MS = 1_000;
 
 /** Where an entry sits in the log: its first appearance if it has revisions, else its seq. */
 export function positionOf(entry: Chronological): number {
@@ -259,11 +299,46 @@ export function chronological<T extends Chronological>(entries: readonly T[]): T
   const rank = (entry: T, ends: T | null): number =>
     entry.kind === 'turn_start' ? -1 : entry.kind === 'turn_end' ? 1 : entry === ends ? 0.5 : 0;
 
+  /*
+   * A native ChatGPT step (a web search, a round's recap) carries only the moment it was read,
+   * while prose carries the moment ChatGPT opened it — and ChatGPT opens a paragraph before the
+   * steps drawn above it can be read. Compared as they are, a round's recap fell after the paragraph
+   * that follows it and headed the next round. A step read after a paragraph was opened but no later
+   * than its text (the same pass included) is placed just before the paragraph.
+   *
+   * A call carries the moment it reached this app, after its trip through the tunnel. One ChatGPT
+   * issued just before opening the paragraph arrives a moment after it, so a call that arrived
+   * within CALL_TRANSIT_MS of the opening is placed before the paragraph too. A later one stays
+   * below it even when the paragraph was read later still: a hidden tab is read slowly.
+   */
+  const readBefore = new Map<T, number>();
+  const placeBefore = (group: readonly T[]): void => {
+    const paragraphs = group.filter(entry => entry.kind === 'assistant_message' && authoredTimeOf(entry) !== undefined)
+      .sort((a, b) => position(a) - position(b) || a.seq - b.seq);
+    // A call only moves above prose read live: the turn went on after it. A paragraph first seen
+    // after a reload was read long after the work below it.
+    const live = paragraphs.filter(entry => group.some(later => later.kind !== 'turn_end' && later.time > entry.time))
+      .sort((a, b) => authoredTimeOf(a)! - authoredTimeOf(b)!);
+    for (const work of group) {
+      if ((work.kind !== 'page_tool' && work.kind !== 'tool_call') || authoredTimeOf(work) !== undefined) continue;
+      // A step belongs to the paragraph after it on the page, which is read after it: when a whole
+      // turn is read late in one pass, every step still keeps to its own paragraph.
+      const prose = work.kind === 'page_tool'
+        ? paragraphs.find(entry => position(entry) > position(work) && authoredTimeOf(entry)! < work.time && work.time <= entry.time + SAME_READ_MS)
+        : live.find(entry => authoredTimeOf(entry)! < work.time && work.time <= authoredTimeOf(entry)! + CALL_TRANSIT_MS);
+      if (!prose) continue;
+      // One scale for steps and calls alike, so the ones moved before a paragraph keep their order.
+      const opened = authoredTimeOf(prose)!, span = Math.max(prose.time + SAME_READ_MS, opened + CALL_TRANSIT_MS) - opened;
+      // Strictly between anything that happened before the paragraph opened and the paragraph itself.
+      readBefore.set(work, opened - 1 + 0.9 * (work.time - opened) / span);
+    }
+  };
+
   // An entry with no usable time is ordered by its stable position (`origin` for a mutable
   // canonical item, otherwise `seq`) rather than being flung to one end of its turn: a
   // missing timestamp is not evidence about when the thing happened.
   const byTime = (a: T, b: T): number => {
-    const apart = (authoredTimeOf(a) ?? a.time) - (authoredTimeOf(b) ?? b.time);
+    const apart = (readBefore.get(a) ?? authoredTimeOf(a) ?? a.time) - (readBefore.get(b) ?? authoredTimeOf(b) ?? b.time);
     return Number.isFinite(apart) && apart !== 0
       ? apart
       : position(a) - position(b) || a.seq - b.seq;
@@ -302,6 +377,7 @@ export function chronological<T extends Chronological>(entries: readonly T[]): T
   for (const anchor of [...groups.keys()].sort((a, b) => a - b)) {
     const group = groups.get(anchor)!;
     const ends = closing(group);
+    placeBefore(group);
     group.sort((a, b) => rank(a, ends) - rank(b, ends) || byTime(a, b));
     out.push(...group);
   }

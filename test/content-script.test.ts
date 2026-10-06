@@ -889,7 +889,9 @@ describe('desktop input delivery and helper ownership', () => {
       await settle(); live.hook.observe(); await settle(); await live.hook.flush();
       const starts = emitted(live.sent, 'turn_start').length;
       if (acknowledge && !invalidate) {
-        expect(emitted(live.sent, 'user_message').filter(row => row.event.messageId === 'm-gated-spa-user').at(-1)?.event.text).toBe(canonical);
+        // Recorded the way ChatGPT shows it: the page renders the submitted text, so an escaped
+        // stored copy is recorded unescaped (the raw copy still decides the receipt above).
+        expect(emitted(live.sent, 'user_message').filter(row => row.event.messageId === 'm-gated-spa-user').at(-1)?.event.text).toBe(submitted);
         live.hook.observe(); await settle(); await live.hook.flush();
         expect(emitted(live.sent, 'turn_start')).toHaveLength(starts);
       }
@@ -3375,6 +3377,27 @@ describe('recording authored message text', () => {
 });
 
 describe('canonical Fiber transcript ingestion in 1.8', () => {
+  it.each([
+    ['marked as Markdown', true, 'Run `echo two` and keep #tags as they are.', 'Run `echo two` and keep #tags as they are.'],
+    ['unmarked but shown unescaped', false, 'Run `echo two` and keep #tags as they are.', 'Run `echo two` and keep #tags as they are.'],
+    ['unmarked and shown with its backslashes', false, 'Run \\`echo two\\` and keep \\#tags as they are.', 'Run \\`echo two\\` and keep \\#tags as they are.']
+  ] as const)('records a user message ChatGPT stored escaped (%s) the way ChatGPT shows it', async (_case, markdown, shown, recorded) => {
+    // ChatGPT stores page-inserted text (Goal replies, app-sent messages with the Core mention) as
+    // escaped Markdown and flags it; it shows the unescaped text. A plain copy is a person's literal.
+    live = await harness();
+    const stored = 'Run \\`echo two\\` and keep \\#tags as they are.';
+    const id = `stored-${_case.replaceAll(' ', '-')}`;
+    const section = userTurn(live.document, id, shown, { sent: false });
+    await bindFiberTurns([{ section, turn: { turnId: id, messages: [{ role: 'user', stable: true,
+      messageId: `m-${id}`, rawMessageId: `m-${id}`, rawText: stored, ...(markdown ? { markdown: true } : {}) }] } }]);
+    await live.hook.flush();
+    await settle();
+    live.hook.observe();
+    await live.hook.flush();
+    const users = emitted(live.sent, 'user_message').map(entry => entry.event).filter(event => event.messageId === `m-${id}`);
+    expect(users.at(-1)?.text).toBe(recorded);
+  });
+
   it('records a raw-provider-ID-only revision without changing canonical message identity', async () => {
     live = await harness();
     const section = assistantTurn(live.document, 'provider-id-revision-turn', []);
@@ -8899,6 +8922,35 @@ describe('a stop button that goes missing while the turn is still running', () =
     expect(live.sent.some((message) => message.type === 'reload_owned_chat')).toBe(false);
   });
 
+  it("does not call a turn stalled while ChatGPT's tool approval card waits for the user", async () => {
+    // VM stress test, 2026-10-06: the card held an echo for ten minutes and the page reported
+    // the turn as dead, although only the user's answer was missing.
+    live = await harness();
+    userTurn(live.document, 'turn-approval-user', 'run the check');
+    startGenerating(live.document);
+    assistantTurn(live.document, 'turn-approval', []);
+    const card = live.document.createElement('div');
+    card.setAttribute('data-codex-approval-surface', 'true');
+    card.append(live.document.createElement('button'), live.document.createElement('button'));
+    card.getClientRects = () => [{ width: 600, height: 200 }] as unknown as DOMRectList;
+    live.document.body.append(card);
+    live.hook.observe();
+    await settle();
+    for (let tick = 0; tick < 2; tick++) {
+      live.advance(live.hook.STALL_MS + 1);
+      live.hook.observe();
+      await settle();
+    }
+    const stallText = 'No visible progress for ten minutes. The app could not confirm that this turn finished.';
+    expect(emitted(live.sent, 'chat_error').map((entry) => entry.event.text)).not.toContain(stallText);
+    // Answered, and then quiet for ten minutes: that is a stall again.
+    card.remove();
+    live.advance(live.hook.STALL_MS + 1);
+    live.hook.observe();
+    await settle();
+    expect(emitted(live.sent, 'chat_error').map((entry) => entry.event.text)).toContain(stallText);
+  });
+
   /**
    * #786: a non-Pro turn at Extra high or above can think for more than ten minutes without
    * changing the page. While its exact liveness holds — this route, native Stop, this
@@ -14157,6 +14209,48 @@ describe('the Compact & resume control', () => {
     expect(compacts.at(-1)).toMatchObject({ token: 'tok-composer-race', sourceLost: true,
       sourceError: expect.stringContaining('message box changed') });
   });
+
+  it.each([['unchanged', true], ['edited', false]] as const)(
+    'rechecks the exact handoff text after a composer remount during authorization (%s)', async (change, accepted) => {
+      const prompt = 'write the exact handoff brief for this session';
+      live = await harness(undefined, {
+        activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null } }),
+        compact: message => {
+          if (message.sourceAttempt) {
+            const editor = live!.document.querySelector('#prompt-textarea') as HTMLElement;
+            const replacement = editor.cloneNode(true) as HTMLElement;
+            replacement.textContent = change === 'unchanged' ? prompt : 'my unrelated draft';
+            editor.replaceWith(replacement);
+            return { ok: true, data: { allowed: true } };
+          }
+          if (message.sourceDispatch) return { ok: true, data: { armed: true } };
+          if (message.sourceLost) return { ok: true, data: { aborted: true } };
+          return {
+            ok: true,
+            data: {
+              started: true,
+              token: 'tok-composer-remount',
+              prompt,
+              job: { sessionId: 's-composer-remount', stage: 'handoff-pending', busy: true, handoffId: null, error: null }
+            }
+          };
+        }
+      });
+      live.hook.injectControl();
+      const sends = watchSend(live.document);
+      live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+        live!.document.querySelector('#prompt-textarea')!.textContent = '';
+      });
+
+      await live.hook.startCompact();
+
+      expect(sends()).toBe(accepted ? 1 : 0);
+      expect(live.sent.filter(message => message.sourceAttempt)).toHaveLength(1);
+      expect(live.sent.filter(message => message.sourceDispatch)).toHaveLength(accepted ? 1 : 0);
+      expect(live.sent.some(message => message.sourceLost)).toBe(!accepted);
+      expect(composerText(live.document)).toBe(accepted ? '' : 'my unrelated draft');
+    }
+  );
 
   /**
    * Cancel, pressed during the part of the run that takes the time.

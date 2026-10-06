@@ -793,6 +793,21 @@
   // hard break kept its backslash, so the page never bound the worker until its turn had ended.
   // A third (#821): an indented line's first space reads back as `&#x20;`. A 96,000-character
   // opening never got its receipt, and the page held its input slot until it was reloaded.
+  /**
+   * The text of a user message as ChatGPT shows it. A message ChatGPT stored as Markdown (page-inserted
+   * text: Goal replies, app sends with the Core mention) comes back escaped, `\\`code\\`` for `code`;
+   * its flag says so. A plain copy is literal and stays exactly as typed.
+   */
+  const shownUserText = (text, markdown, rendered = null) => {
+    if (markdown) return unescapeMarkdown(text);
+    // ChatGPT's own rendering is the other proof: when the page shows exactly the unescaped text,
+    // the backslashes were storage escapes. A person's literal backslash is shown and stays.
+    if (typeof rendered === 'string' && rendered && text !== rendered && text.includes('\\')) {
+      const unescaped = unescapeMarkdown(text);
+      if (sendText(unescaped) === sendText(rendered)) return unescaped;
+    }
+    return text;
+  };
   const unescapeMarkdown = (value) => String(value || '').replace(/\\\r?\n/g, '\n').replace(/\\([!-\/:-@\[-`{-~])/g, '$1')
     .replace(/(^|\n)&#x20;/g, '$1 ');
   /** The leading continuation marker, as typed or as the composer escaped it. */
@@ -829,6 +844,7 @@
     // plain-text bubble retains the existing exact-text receipt contract; no Markdown stripping.
     const actual = authored.length === 1 ? authored[0].rawText : message.text;
     return typeof actual === 'string' && actual.length <= 256000 ? { text: actual, canonical: authored.length === 1,
+      markdown: authored.length === 1 && authored[0].markdown === true,
       ...(authored[0]?.attachments?.length ? { attachments: authored[0].attachments } : {}) } : null;
   }
   function userMessagePresent(message) {
@@ -2171,7 +2187,17 @@
    * is what makes `lastChangeAt` mean anything.
    */
   function turnStalled() {
-    return turnStartedAt > 0 && Date.now() - lastChangeAt > STALL_MS;
+    return turnStartedAt > 0 && Date.now() - stallClock() > STALL_MS;
+  }
+
+  /**
+   * `lastChangeAt`, held at now while ChatGPT's tool approval card waits for the user: that wait
+   * is not a stall, and calling it one told the user the turn had died (VM stress test,
+   * 2026-10-06). Once the card is answered, ten quiet minutes count from that moment.
+   */
+  function stallClock() {
+    if (turnStartedAt > 0 && CLF_DOM.approvalWaiting()) lastChangeAt = Math.max(lastChangeAt, Date.now());
+    return lastChangeAt;
   }
 
   /** Exact aliases match shared/chat-models.ts::isProModel (the extension is plain JS). */
@@ -2362,9 +2388,10 @@
         }
         markSeen(key, reaction);
         if (justAuthored) newUserMessage = justAuthored;
+        const shown = shownUserText(text, source.markdown, message.text);
         emit({
           kind: 'user_message',
-          text,
+          text: shown,
           ...(reaction !== undefined ? { reaction } : {}),
           ...(source.attachments?.length ? { attachments: source.attachments } : {}),
           messageId: message.id,
@@ -2373,7 +2400,7 @@
           ...(justAuthored ? { authoredNow: true } : {})
         });
         reportedUserMessages.delete(message.id);
-        reportedUserMessages.set(message.id, { text, createTime: null, conversationId: CLF_DOM.conversationId(), model: sentModel || null });
+        reportedUserMessages.set(message.id, { text: shown, createTime: null, conversationId: CLF_DOM.conversationId(), model: sentModel || null });
         if (reportedUserMessages.size > 256) reportedUserMessages.delete(reportedUserMessages.keys().next().value);
       } else if (message.role === 'assistant') {
         // Assistant identity/content comes exclusively from the MAIN-world Fiber scan now.
@@ -2880,7 +2907,7 @@
       // generic stall, including when it appears after a long quiet run.
       const thinkingFailure = quietOutcome?.reason === 'thinking_failed' || visibleErrors.some(
         error => error.reason === 'thinking_failed' && localErrorGeneration(error) === turnId && !isStale(error.node));
-      if (!thinkingFailure && !stallReported && Date.now() - lastChangeAt > STALL_MS && !deliberateTurnLive()) {
+      if (!thinkingFailure && !stallReported && Date.now() - stallClock() > STALL_MS && !deliberateTurnLive()) {
         stallReported = true;
         emit({
           kind: 'chat_error',
@@ -3636,6 +3663,8 @@
           /^[a-z0-9][a-z0-9._-]{0,63}$/i.test(entry.resolvedModel) ? { resolvedModel: entry.resolvedModel } : {}),
         ...(references ? { references } : {}),
         rawText,
+        // A boolean from MAIN; only `true` exactly means ChatGPT stored this as escaped Markdown.
+        ...(entry.role === 'user' && entry.markdown === true ? { markdown: true } : {}),
         ...(attachments.length ? { attachments } : {}),
         renderedHtml,
         sectionIndex:
@@ -4703,13 +4732,13 @@
           emit({
             kind: 'user_message',
             messageId: message.messageId,
-            text: message.rawText,
+            text: shownUserText(message.rawText, message.markdown === true, renderedUserTexts.get(message.messageId)),
             ...(message.attachments?.length ? { attachments: message.attachments } : {}),
             ...(sentModel ? { model: sentModel } : {}),
             ...(message.createTime ? { time: message.createTime, authoredTime: true, authoredAt: message.createTime } : {})
           });
           reportedUserMessages.delete(message.messageId);
-          reportedUserMessages.set(message.messageId, { text: message.rawText, createTime: message.createTime || null,
+          reportedUserMessages.set(message.messageId, { text: shownUserText(message.rawText, message.markdown === true, renderedUserTexts.get(message.messageId)), createTime: message.createTime || null,
             conversationId: CLF_DOM.conversationId(), model: sentModel || null });
           if (reportedUserMessages.size > 256) reportedUserMessages.delete(reportedUserMessages.keys().next().value);
           continue;
@@ -6656,7 +6685,9 @@
         fiber: fiberPresent === null ? undefined : !fiberPresent ? 'absent' : fiberTurns.size === 0 ? 'empty' : 'ok',
         // This document's own open turn, which it closes itself on end_turn or after ten
         // minutes without progress. Keeps a long-thinking worker from being slept as silent.
-        generating
+        generating,
+        // ChatGPT's own approval card: the turn waits for a person, so the app tells them.
+        approval: CLF_DOM.approvalWaiting()
       });
       if (!reply || reply.ok !== true || !reply.data) {
         // Keep waiting only for failures that can genuinely mean "the local app/worker is
@@ -9788,7 +9819,11 @@
         renderControl();
         return;
       }
-      if (!sameSource() || CLF_DOM.composer() !== composer || squeeze(composer.textContent) !== squeeze(prompt)) {
+      // React may replace the editor node while the durable send permit is pending.
+      // Reacquire the current editable composer and verify the exact frozen prompt: an
+      // unchanged draft survives remounts, while changed or user-owned text still fails closed.
+      const sendComposer = editable();
+      if (!sameSource() || !sendComposer || squeeze(sendComposer.textContent) !== squeeze(prompt)) {
         CLF_DOM.clearPromptExact(prompt);
         return void (await abandonBeforeSend(
           t(

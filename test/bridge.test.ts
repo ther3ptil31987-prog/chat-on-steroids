@@ -2480,6 +2480,9 @@ describe('automatic compaction', () => {
     const handout = (await request('GET', '/status')).body.repairs
       .filter((row: { conversationId: string }) => row.conversationId === conversationId);
     expect(handout).toEqual([expect.objectContaining({ reason: 'compaction' })]);
+    // The browser may also claim it, and so open the chat's tab again. A refused claim left the
+    // offer unclaimed until the app gave up ("no page; not offering again"), 2026-10-06 on 2.1.28.
+    expect((await request('POST', '/repairs/claim', { body: { token: handout[0].token } })).body.allowed).toBe(true);
   });
 
   it('keeps the concrete pre-send failure and refuses a stale page abort of a newer ticket', async () => {
@@ -6094,6 +6097,30 @@ describe('delivering a bootstrap', () => {
     }
   });
 
+  it("leaves a worker awake while its page shows ChatGPT's tool approval card", async () => {
+    // VM stress test, 2026-10-06: the card holds the call before it is sent, so the chat is
+    // silent with no call recorded, and only the user can answer it.
+    await pair();
+    spawn({ workers: [{ task: 'wait for approval' }], caller: { conversationId: PRIME_CHAT } });
+    const workerConversation = 'cafe1006-0000-4000-8000-000000001006';
+    expect(bindConversation('worker-1', workerConversation)).toBe(true);
+    const worker = () => swarmStateForCaller({ conversationId: PRIME_CHAT }).agents.find((agent) => agent.id === 'worker-1')!;
+    const quietAt = Math.max(worker().activatedAt ?? 0, worker().lastSeenAt ?? 0) + WORKER_SILENCE_MS + 1_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(quietAt);
+    try {
+      expect((await request('GET', `/activity?conversationId=${workerConversation}&generating=0&approval=1`)).status).toBe(200);
+      expect(await sweepStaleSwarm(quietAt)).toBe(false);
+      expect(worker().state).toBe('active');
+      expect(getLog().some((entry) => entry.message.includes(`${workerConversation} waits for the user to answer ChatGPT's tool approval card`))).toBe(true);
+      // Answered: the same silence now counts.
+      expect((await request('GET', `/activity?conversationId=${workerConversation}&generating=0&approval=0`)).status).toBe(200);
+      expect(await sweepStaleSwarm(quietAt)).toBe(true);
+      expect(worker().state).toBe('sleeping');
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it('does not hand a slept worker its dead turn, nor count its replayed native rows as work', async () => {
     // Measured 2026-09-26 (worker-8): a turn left open the day before was adopted by the reopened
     // tab, which refused the wake as "generating" until a ten-minute stall, and its native rows —
@@ -8768,6 +8795,126 @@ describe('unattributed activity recovery', () => {
     } finally { vi.useRealTimers(); await saveConfig(previous); }
   });
 
+  it("holds silence recovery while ChatGPT's tool approval card waits, and recovers once it is answered", async () => {
+    // VM stress test, 2026-10-06: a reload cannot answer the card, and only the user can.
+    const previous = getConfig();
+    await saveConfig({ ...previous, ui: { ...previous.ui, autoContinue: true } });
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const chat = randomUUID();
+      await events(chat, [
+        { kind: 'user_message', messageId: 'question', text: 'Run the check', time: Date.now(), authoredNow: true },
+        { kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() },
+        openTurn('waits-on-approval')
+      ]);
+      await attributed(chat, false, Date.now());
+      for (let pass = 0; pass < 3; pass++) {
+        await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS / 2);
+        expect((await request('GET', `/activity?conversationId=${chat}&approval=1`)).status).toBe(200);
+        await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS / 2);
+        await sweepStaleSwarm(Date.now());
+        expect(await maintenance(), 'a reload was queued over the approval card').toBeNull();
+      }
+      const why = getLog().filter(entry => entry.message.includes(`silence recovery for ${chat}`)).map(entry => entry.message);
+      expect(why).toEqual([expect.stringContaining('waiting: ChatGPT asks the user to allow or deny a tool call')]);
+      expect((await request('GET', `/activity?conversationId=${chat}&approval=0`)).status).toBe(200);
+      await vi.advanceTimersByTimeAsync(GOAL_QUIET_MS);
+      await sweepStaleSwarm(Date.now());
+      expect(await maintenance()).toMatchObject({ conversationId: chat, reason: 'silence' });
+    } finally { vi.useRealTimers(); await saveConfig(previous); }
+  });
+
+  it('says why silence recovery waits on a running call of unknown chat, and recovers once it ends (#1086)', async () => {
+    const previous = getConfig();
+    await saveConfig({ ...previous, ui: { ...previous.ui, autoContinue: true } });
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const chat = randomUUID(), turnId = 'waits-on-unknown-call';
+      await events(chat, [
+        { kind: 'user_message', messageId: 'question', text: 'Review the changes', time: Date.now(), authoredNow: true },
+        { kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() },
+        openTurn(turnId)
+      ]);
+      await attributed(chat, false, Date.now());
+      const { trackInFlight, emptyEvidence } = await import('../src/main/mcp/call-context.js');
+      // Another chat's call that no page has claimed yet: it counts as possibly this chat's work.
+      await trackInFlight({ startedAt: Date.now(), transportKey: null, agent: null, outcome: null, evidence: emptyEvidence(),
+        caller: { conversationId: null, requestId: 'unknown-chat-call', transportKey: null } }, async () => {
+        // Within the hold for calls of no known chat, every pass waits.
+        for (let pass = 0; pass < 2; pass++) {
+          await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS);
+          await sweepStaleSwarm(Date.now());
+          expect(await maintenance()).toBeNull();
+        }
+      });
+      const why = getLog().filter(entry => entry.message.includes(`silence recovery for ${chat}`)).map(entry => entry.message);
+      expect(why).toEqual([expect.stringContaining('a tool call whose chat is not known yet is running')]);
+      // The call ended: the next pass recovers the chat.
+      await vi.advanceTimersByTimeAsync(GOAL_QUIET_MS);
+      await sweepStaleSwarm(Date.now());
+      expect(await maintenance()).toMatchObject({ conversationId: chat, reason: 'silence' });
+    } finally { vi.useRealTimers(); await saveConfig(previous); }
+  });
+
+  it('lets calls of no known chat hold a silent chat only for a while, then recovers it anyway (#1086)', async () => {
+    const input = await import('../src/main/session/input.js');
+    const { recoveryHeldByCalls, recoveryInputAllowed, sessionInputActivity } = await import('../src/main/bridge.js');
+    // The app's own wiring (ipc.ts): the automatic Continue asks the bridge whether it is allowed.
+    input.configureInputDelivery({ recoveryAllowed: recoveryInputAllowed, callsHoldRecovery: recoveryHeldByCalls,
+      activity: sessionInputActivity, applyAutomation: async () => {}, changed: () => {} });
+    const previous = getConfig();
+    await saveConfig({ ...previous, ui: { ...previous.ui, autoContinue: true } });
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const chat = randomUUID(), turnId = 'held-by-another-chat';
+      await events(chat, [
+        { kind: 'user_message', messageId: 'question', text: 'Review the changes', time: Date.now(), authoredNow: true },
+        { kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() },
+        openTurn(turnId)
+      ]);
+      await attributed(chat, false, Date.now());
+      const { trackInFlight, emptyEvidence } = await import('../src/main/mcp/call-context.js');
+      // Another chat keeps a call of no proven chat running the whole time (a worker polling
+      // every 30 s did, on 2026-10-05): it can no longer keep this chat waiting forever.
+      await trackInFlight({ startedAt: Date.now(), transportKey: null, agent: null, outcome: null, evidence: emptyEvidence(),
+        caller: { conversationId: null, requestId: 'never-claimed', transportKey: null } }, async () => {
+        await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS);
+        await sweepStaleSwarm(Date.now());
+        expect(await maintenance()).toBeNull();
+        let repair = null;
+        for (let pass = 0; pass < 6 && !repair; pass++) {
+          await vi.advanceTimersByTimeAsync(GOAL_QUIET_MS);
+          await sweepStaleSwarm(Date.now());
+          repair = await maintenance();
+        }
+        expect(repair).toMatchObject({ conversationId: chat, reason: 'silence' });
+        // The reload changed nothing and the other chat's call still runs: the one automatic
+        // Continue is filed anyway, which is what never came in the reported run.
+        await maintenance(repair!.token, 'reloaded');
+        const session = (await findSessionByConversation(chat))!;
+        let continues: Awaited<ReturnType<typeof input.listInputs>> = [];
+        for (let pass = 0; pass < 6 && !continues.length; pass++) {
+          await vi.advanceTimersByTimeAsync(GOAL_QUIET_MS);
+          await sweepStaleSwarm(Date.now());
+          continues = (await input.listInputs()).filter(row => row.sessionId === session.id && row.recovery);
+        }
+        expect(continues).toHaveLength(1);
+      });
+      const why = getLog().filter(entry => entry.message.includes(`silence recovery for ${chat}`)).map(entry => entry.message);
+      expect(why.slice(0, 2)).toEqual([
+        expect.stringContaining('a tool call whose chat is not known yet is running'),
+        expect.stringContaining('going ahead: tool calls whose chat is not known have held it for 3 minutes')
+      ]);
+    } finally {
+      // This suite runs without the app's delivery hooks; leave none behind for the next test.
+      input.configureInputDelivery(null as never);
+      await writeDurableNow('session-input', []); input.resetInputForTests(); vi.useRealTimers(); await saveConfig(previous);
+    }
+  });
+
   it.each(['normal', 'pro'] as const)('keeps the %s silence countdown and reload valid across same-turn corrections', async model => {
     const previous = getConfig();
     await saveConfig({ ...previous, ui: { ...previous.ui, autoContinue: true } });
@@ -8839,6 +8986,9 @@ describe('unattributed activity recovery', () => {
         expect((await sessionControlsFor(session.id)).recovery).toEqual([]);
       }
       expect(getLog().filter(entry => entry.message.includes('asking the browser to reload') && entry.message.includes(chat))).toEqual([]);
+      // It says why, once, however often the sweep passes (#1086: these exits used to be silent).
+      const why = getLog().filter(entry => entry.message.includes(`silence recovery for ${chat}`)).map(entry => entry.message);
+      expect(why).toEqual([expect.stringContaining('spent: the silent work is no longer this chat\'s current turn')]);
     } finally { vi.useRealTimers(); await saveConfig(previous); }
   });
 

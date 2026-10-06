@@ -111,7 +111,8 @@ import {
   type ChatObservation,
   type PageCallEvidence
 } from './session/recorder.js';
-import { noticeChatStopped } from './stuck-notice.js';
+import { noticeApprovalWaiting, noticeChatStopped } from './stuck-notice.js';
+import { approvalCardWaiting, noteApprovalCard, resetApprovalWaits, type ApprovalWaitDeps } from './approval-wait.js';
 import {
   autoCompactionReady,
   automaticCompactionAllowed,
@@ -131,7 +132,7 @@ import {
   turnEndedDurably,
   requestTurnOwnershipCutoff
 } from './session/store.js';
-import { inFlightMcpRequests, runningToolCalls, runningToolProgress, settlingToolCalls } from './mcp/call-context.js';
+import { inFlightMcpRequests, inFlightToolCalls, runningToolCalls, runningToolProgress, settlingToolCalls } from './mcp/call-context.js';
 import { setLivePreview } from './live-preview.js';
 import { nativeHandoffPrompt } from './session/handoff-prompt.js';
 import { DEFAULT_HANDOFF_PROMPT } from '../shared/handoff.js';
@@ -2584,7 +2585,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!found) return json(res, 200, { allowed: false }, origin);
     const [conversationId, repair] = found;
     const session = await getSession(repair.sessionId);
-    const current = session?.conversationId === conversationId && departureAllowsRepair(session) &&
+    // A Compact & resume the user pressed may act on the chat they closed: handout and claim agree.
+    const current = session?.conversationId === conversationId && departureAllowsRepairFor(session, repair.reason, repair.episode) &&
       !(repair.reason !== 'compaction' && !session.activeTurnId && session.lastTurnOutcome === 'stopped') && !isChatBlocked(conversationId) &&
       !stopRequestedFor(conversationId) && await attributionRepairAllowed(repair, session) &&
       await assistantRepairCurrent(conversationId, repair) && await silenceRepairCurrent(conversationId, repair) &&
@@ -2928,6 +2930,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
      * never told that what is driving it is unknown.
      */
     const astraSession = await findSessionByConversation(id, { requireUnique: true });
+    // ChatGPT's own tool approval card on this page: see approval-wait.ts. Older extensions omit it.
+    const pageApproval = url.searchParams.get('approval');
+    if (pageApproval === '1' || pageApproval === '0')
+      void noteApprovalCard(id, pageApproval === '1', astraSession?.id ?? null, approvalWaitDeps).catch(() => undefined);
     const finishOnly = !!astraSession && await astraFinishOnly(astraSession.id, id);
     const silenceSuppressed = finishOnly || await suppressProSilence(id);
     const goalView = async () => {
@@ -4964,7 +4970,7 @@ async function sweepOwnedSwarm(runId: string, now: number): Promise<boolean> {
   for (const slept of sleepSilentWorkers(
     now,
     runId,
-    id => runningToolProgress(id) !== null,
+    id => runningToolProgress(id) !== null || approvalCardWaiting(id, now),
     id => unresolvedTurns.get(id)?.turnId,
     id => unresolvedTurns.get(id)?.requestOriginMax
   )) {
@@ -6475,6 +6481,48 @@ const compactionFilings = new Set<string>();
  */
 const lastAttributedCallAt = new Map<string, number>();
 export const GOAL_QUIET_MS = 60_000;
+
+const approvalWaitDeps: ApprovalWaitDeps = {
+  record: (sessionId, progressId, text, anchor) => recordProgress(sessionId, progressId, text, anchor),
+  notify: noticeApprovalWaiting,
+  log: logInfo
+};
+/**
+ * How long tool calls of no known chat may hold one silent chat's recovery (#1086).
+ *
+ * A call whose chat is not proven yet might be this chat's, so recovery waits for it. But a silent
+ * chat's own call shows on its page, and the page soon proves it; calls that stay unknown while
+ * the chat is silent are another chat's. On 2026-10-05 a worker's call every 30 s kept one such
+ * call running almost all the time, and a recovered chat waited seventeen minutes for a Continue
+ * that never came. Its own calls still hold it for as long as they run.
+ */
+export const UNKNOWN_CALL_HOLD_MS = 3 * 60_000;
+const unknownCallHold = new WeakMap<ActivityGrant, number>();
+
+/**
+ * What running work keeps this grant's recovery waiting: its own calls always; calls of no known
+ * chat until UNKNOWN_CALL_HOLD_MS after the silence sweep first found them holding it. Only that
+ * sweep starts the clock (`measure`), so work done while the chat was busy never shortens it.
+ */
+function silenceHeldByCalls(conversationId: string, grant: ActivityGrant | undefined, now = Date.now(), measure = false): 'own' | 'unknown' | null {
+  // A call ChatGPT holds behind its approval card is this chat's own, and only the user moves it.
+  if (runningToolProgress(conversationId) || approvalCardWaiting(conversationId, now)) return 'own';
+  if (runningToolCalls(conversationId) === 0) return null;
+  if (!grant) return 'unknown';
+  if (measure && !unknownCallHold.has(grant)) unknownCallHold.set(grant, now);
+  const since = unknownCallHold.get(grant);
+  return since === undefined || now - since < UNKNOWN_CALL_HOLD_MS ? 'unknown' : null;
+}
+
+/** The input outbox's check for an automatic Continue: the same bounded hold, over settling calls too. */
+export function recoveryHeldByCalls(conversationId: string): boolean {
+  if (approvalCardWaiting(conversationId)) return true;
+  if (inFlightToolCalls(conversationId) === 0) return false;
+  if (runningToolProgress(conversationId)) return true;
+  const grant = activeUntil.get(conversationId);
+  const since = grant ? unknownCallHold.get(grant) : undefined;
+  return since === undefined || Date.now() - since < UNKNOWN_CALL_HOLD_MS;
+}
 export const PRO_SILENCE_MS = 10 * 60_000;
 export const PRO_ACTIVITY_MS = 10 * 60_000;
 /**
@@ -6513,7 +6561,7 @@ export function sessionInputActivity(summary: SessionSummary): InputActivity {
     liveConversations().some(row => row.sessionId === summary.id && row.conversationId === id && !!row.activeTurnId);
   return { exact, model: grant?.sessionId === summary.id && (grant.turnId === summary.activeTurnId || mcpWindow) ? grant.model : 'unknown',
     ...(exact && (summary.activeTurnId || (mcpWindow && grant?.turnId)) ? { turnId: summary.activeTurnId || grant!.turnId! } : {}),
-    possible: exact || runningToolCalls(id) > 0 ||
+    possible: exact || !!silenceHeldByCalls(id, grant?.sessionId === summary.id ? grant : undefined) ||
     (expiry !== undefined && expiry !== null && expiry > Date.now()) };
 }
 export function sessionActivityExpiresAt(summary: SessionSummary): number | null | undefined {
@@ -6736,7 +6784,7 @@ async function fileSilenceTickets(spent: readonly string[], now: number): Promis
     if (!grant?.turnId || start?.turnId !== grant.turnId || goalActiveFor(conversationId)) continue;
     if (!grant || activeUntil.get(conversationId) !== grant ||
         (grant.model === 'pro' && !grant.thinkingFailed && now - grant.evidenceAt < PRO_SILENCE_MS)) continue;
-    if (goalPendingReplyFor(conversationId) || runningToolCalls(conversationId) > 0) continue;
+    if (goalPendingReplyFor(conversationId) || silenceHeldByCalls(conversationId, grant, now)) continue;
     if (continuationForSession(session.id)) continue;
     // Canonical message replacement leaves sequence gaps; the summary count is not a cursor.
     const [boundary] = await readRecentEvents(session.id, 1);
@@ -6757,9 +6805,9 @@ async function fileSilenceTickets(spent: readonly string[], now: number): Promis
         blocked: false,
         handledOnly: true,
         current: () => activeUntil.get(conversationId) === grant && repairsInFlight.get(conversationId) === held &&
-          runningToolCalls(conversationId) === 0 && !stopRequestedFor(conversationId) && !goalActiveFor(conversationId)
+          !silenceHeldByCalls(conversationId, grant) && !stopRequestedFor(conversationId) && !goalActiveFor(conversationId)
       });
-      if (activeUntil.get(conversationId) !== grant || runningToolCalls(conversationId) > 0) {
+      if (activeUntil.get(conversationId) !== grant || silenceHeldByCalls(conversationId, grant)) {
         const pending = goalPendingReplyFor(conversationId);
         if (pending?.turnId === turnId) await withdrawSilenceGoalReplyNow(conversationId, pending.replyId);
       }
@@ -6779,7 +6827,7 @@ async function fileSilenceInputTicket(conversationId: string, now: number, liste
       !await turnHasMcpCall(grant.sessionId, conversationId, grant.turnId)) return false;
   const current = () => activeUntil.get(conversationId) === grant && repairsInFlight.get(conversationId) === repair &&
     !stopRequestedFor(conversationId) && !isChatBlocked(conversationId) &&
-    !continuationForSession(grant.sessionId) && runningToolCalls(conversationId) === 0 &&
+    !continuationForSession(grant.sessionId) && !silenceHeldByCalls(conversationId, grant) &&
     // Ordinary silence needs a quiet recorder. An exact failed-source receipt can
     // publish its existing listening deadline while an unrelated chat is recording;
     // grant identity and the outbox's source/work checks still fence renewed work.
@@ -7167,7 +7215,7 @@ async function silenceRepairCurrent(conversationId: string, repair: Repair): Pro
   const current = () => !!grant?.turnId && activeUntil.get(conversationId) === grant &&
     repairsInFlight.get(conversationId) === repair && !stopRequestedFor(conversationId) &&
     !isChatBlocked(conversationId) && !continuationForSession(repair.sessionId) &&
-    runningToolCalls(conversationId) === 0;
+    !silenceHeldByCalls(conversationId, grant);
   if (!current()) return false;
   return await silenceSourceCurrent(conversationId, grant!) && current();
 }
@@ -7969,34 +8017,70 @@ function browserRecoveryMonitoring(): boolean {
  * asks whether a conversation is still alive, so nothing scoped to one of its turns may switch
  * it off — see the supersede rule in `queueBrowserRecovery`.
  */
+/**
+ * Why silence recovery left a chat alone, said once per grant and reason (#1086).
+ *
+ * Every exit of the sweep used to be silent, so a chat that never got its automatic Continue left
+ * a log that simply stopped: the 2026-10-05 report showed a confirmed error reload and then
+ * seventeen quiet minutes. Repeated sweeps of the same grant say nothing new.
+ */
+const silenceNotes = new Set<string>();
+function noteSilence(conversationId: string, grant: ActivityGrant, reason: string): void {
+  const key = `${conversationId}:${grant.turnId ?? '-'}:${grant.sessionId}:${reason}`;
+  if (silenceNotes.has(key)) return;
+  silenceNotes.add(key);
+  if (silenceNotes.size > 500) for (const old of [...silenceNotes].slice(0, 100)) silenceNotes.delete(old);
+  logInfo(`bridge: silence recovery for ${conversationId} — ${reason}`);
+}
+
 async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent: string[] }> {
   let queued = false;
   let deferred = false;
   const spent: string[] = [];
   const compacting = new Set(pendingContinuations().map((entry) => entry.from));
   for (const [conversationId, grant] of activeUntil) {
-    if (compacting.has(conversationId)) continue;
     if (grant.until > now) continue;
+    if (compacting.has(conversationId)) { noteSilence(conversationId, grant, 'a Compact & Resume handoff owns this chat\'s recovery'); continue; }
+    // Before the "no recorded call" verdict below: a call waiting for approval was never sent,
+    // so none is recorded, and only the user can answer the card. Measured live on 2026-10-06.
+    if (approvalCardWaiting(conversationId, now)) {
+      noteSilence(conversationId, grant, 'waiting: ChatGPT asks the user to allow or deny a tool call');
+      grant.until = now + GOAL_QUIET_MS;
+      deferred = true;
+      continue;
+    }
     // Observation owns liveness, never permission to interrupt the native page.
     // Only an exactly recorded local call in this source turn earns silence repair.
     if (!grant.turnId || !await turnHasMcpCall(grant.sessionId, conversationId, grant.turnId)) {
-      if (activeUntil.get(conversationId) === grant) spent.push(conversationId);
+      if (activeUntil.get(conversationId) === grant) {
+        noteSilence(conversationId, grant, grant.turnId
+          ? `not available: turn ${grant.turnId} has no tool call recorded for this chat (calls from ChatGPT's code mode are often not attributed)`
+          : 'not available: the silent work has no turn');
+        spent.push(conversationId);
+      }
       continue;
     }
     const pro = await extendedSilenceWindowFor(conversationId, grant.sessionId);
     const afterTurn = recoveryInputAllowed(grant.sessionId, conversationId) || loopAfterTurnFor(conversationId) || await hasQueuedAfterTurnInput(grant.sessionId);
     if (activeUntil.get(conversationId) !== grant) continue;
-    if (runningToolProgress(conversationId) || (afterTurn && runningToolCalls(conversationId) > 0)) {
+    const heldBy = silenceHeldByCalls(conversationId, grant, now, true);
+    if (heldBy === 'own' || (afterTurn && heldBy === 'unknown')) {
+      noteSilence(conversationId, grant, heldBy === 'own'
+        ? 'waiting: a tool call of this chat is still running'
+        : 'waiting: a tool call whose chat is not known yet is running, and it might be this chat\'s');
       grant.until = now + GOAL_QUIET_MS;
       deferred = true;
       continue;
     }
+    if (afterTurn && runningToolCalls(conversationId) > 0)
+      noteSilence(conversationId, grant, `going ahead: tool calls whose chat is not known have held it for ${UNKNOWN_CALL_HOLD_MS / 60_000} minutes while it stayed silent`);
     // A blocked chat never gets the reload, so it can never get the confirmation this pass
     // otherwise waits for, and it would sit measured-silent in the ledger — and in the live set
     // the UI paints — for the rest of the process. Its silence is spent the moment it is
     // measured. (A blocked chat's worker slot is not this pass's business: sweepStaleSwarm
     // sleeps it from the block itself, grant or no grant.)
     if (isChatBlocked(conversationId)) {
+      noteSilence(conversationId, grant, 'not available: this chat is blocked');
       spent.push(conversationId);
       continue;
     }
@@ -8015,6 +8099,7 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
         deferred = true;
         continue;
       }
+      noteSilence(conversationId, grant, 'not available: automatic recovery is off for this chat and no Goal, Loop or queued message waits on it');
       spent.push(conversationId);
       continue;
     }
@@ -8025,6 +8110,7 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
         deferred = true;
         continue;
       }
+      noteSilence(conversationId, grant, `spent: its ${held.reason} reload already happened`);
       spent.push(conversationId);
       continue;
     }
@@ -8042,6 +8128,7 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
     // has run out.
     const lastReload = lastBrowserRecoveryAt.get(conversationId) ?? 0;
     if (awaitingReturn.has(conversationId) && now - lastReload < BROWSER_RECOVERY_COOLDOWN_MS) {
+      noteSilence(conversationId, grant, 'waiting: the page has not come back from the last reload yet');
       grant.until = lastReload + BROWSER_RECOVERY_COOLDOWN_MS;
       deferred = true;
       continue;
@@ -8054,7 +8141,10 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
         // Preserve its original silence deadline so a real page return does
         // not pretend to be fresh work or start another waiting window.
         if (!grant.thinkingFailed && now < activityDeadline(grant)) deferred = true;
-        else spent.push(conversationId);
+        else {
+          noteSilence(conversationId, grant, 'spent: the silent work is no longer this chat\'s current turn (a newer question, a close or a Stop)');
+          spent.push(conversationId);
+        }
       }
       continue;
     }
@@ -9093,6 +9183,12 @@ async function confirmRepair(token: string, action: 'reloaded' | 'reopened' | 'r
         );
       }
       if (repair.reason === 'assistant-error') {
+        // The automatic Continue after this reload comes only through the silence watch, which needs
+        // this chat's activity grant (#1086). Without one nothing follows, so say so.
+        const watch = activeUntil.get(conversationId);
+        logInfo(watch
+          ? `bridge: ${conversationId} stays under the silence watch after its error reload (turn ${watch.turnId ?? 'unknown'})`
+          : `bridge: ${conversationId} has no activity left for the silence watch after its error reload; no automatic Continue follows unless it works again`);
         // Charge the original question, never the replacement document seen at ACK time.
         if (repair.assistantSource) turnRepairSpent.set(conversationId,
           { sessionId: repair.sessionId, turnKey: repair.assistantSource.key, token: repair.token, at: Date.now() });
@@ -10362,6 +10458,7 @@ export function workerBriefForTests(agent: string, task: string): string {
 }
 
 export function resetBridgeForTests(): void {
+  resetApprovalWaits();
   clearCompanionDiagnostics();
   for (const command of commands) if (command.timer) clearTimeout(command.timer);
   if (browserPresenceTimer) clearTimeout(browserPresenceTimer);

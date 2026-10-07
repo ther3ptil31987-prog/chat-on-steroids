@@ -5,6 +5,7 @@ import { displayLocalServer } from './local-url.js';
 import { paintPluginRefreshReminder } from './plugin-refresh-reminder.js';
 import { initUsage, refreshUsage } from './usage.js';
 import { initSidebarResize } from './sidebar-resize.js';
+import { initViewMenu } from './view-menu.js';
 import { initPlugins, applyPluginsState } from './plugins.js';
 import { initBrowserPreferences } from './browser-preferences.js';
 import { initSetupGuide } from './setup-guide.js';
@@ -13,6 +14,7 @@ import { initKeychainNotice } from './keychain-notice.js';
 import { initPet } from './pet.js';
 import { initPets } from './pets.js';
 import { initSkillsLibrary } from './skills-library.js';
+import { initWhatsNew } from './whats-new.js';
 import { initSettingsSearch } from './settings-search.js';
 import type { AppearanceSettings } from '../shared/appearance.js';
 import type { BrowserBridgePort } from '../shared/browser-bridge.js';
@@ -46,7 +48,7 @@ import {
 } from '../shared/types.js';
 import type { SwarmState } from '../shared/session.js';
 import { $, ago, disclosureChevron, el, icon, run, shortAgo, toast } from './dom.js';
-import { chatApply, chatSettingsPatch, chatVisible, initChat, openChatView } from './chat.js';
+import { chatApply, chatSettingsPatch, chatVisible, initChat, openChatSearch, openChatView } from './chat.js';
 import { publishStopNoticeTexts } from './stop-notices.js';
 import { publishMainTexts } from './main-texts.js';
 
@@ -294,7 +296,6 @@ $('newChat').addEventListener('click', () => showTab('chat'));
 $('sidebarPlugins').addEventListener('click', () => showTab('plugins'));
 $('sidebarPets').addEventListener('click', () => showTab('pets'));
 $('sidebarSkills').addEventListener('click', () => showTab('skills'));
-$('viewPets').addEventListener('click', () => { ($('viewMenu') as HTMLDetailsElement).open = false; pet.toggle(); });
 api.onPetOverlayOpenOwner(screen => showTab(screen));
 $('addProject').addEventListener('click', () => showTab('chat'));
 $('composerFolder').addEventListener('click', () => $('addProject').click());
@@ -303,16 +304,13 @@ let zoomEdited = false;
 void api.getZoom().then(result => {
   if (zoomEdited || !result.ok || typeof result.data !== 'number' || !Number.isFinite(result.data)) return;
   zoomFactor = result.data;
-  $('zoomReset').textContent = `${Math.round(zoomFactor * 100)}%`;
 });
 async function zoom(next: number): Promise<void> {
   zoomEdited = true;
   const result = await run(api.setZoom(Math.min(1.5, Math.max(.75, next))));
-  if (result !== null) { zoomFactor = result; $('zoomReset').textContent = `${Math.round(result * 100)}%`; }
+  if (result !== null) zoomFactor = result;
+  viewMenu.refresh();
 }
-$('zoomOut').addEventListener('click', () => void zoom(zoomFactor - .1));
-$('zoomIn').addEventListener('click', () => void zoom(zoomFactor + .1));
-$('zoomActualSize').addEventListener('click', () => void zoom(1));
 document.addEventListener('keydown', (event) => {
   if (!(event.ctrlKey || event.metaKey) || !['+', '=', '-', '0'].includes(event.key)) return;
   event.preventDefault(); void zoom(event.key === '0' ? 1 : zoomFactor + (event.key === '-' ? -.1 : .1));
@@ -2487,6 +2485,13 @@ async function refresh(): Promise<void> {
 
 buildGroups();
 initSidebarResize();
+const viewMenu = initViewMenu({
+  search: openChatSearch,
+  cosBrowser: () => state?.config.ui.chatBrowser === 'cos',
+  showCosBrowser: () => void run(api.showCosBrowser()),
+  pets: { toggle: () => pet.toggle(), visible: () => pet.isVisible() },
+  zoom: { step: delta => zoom(zoomFactor + delta), reset: () => zoom(1), percent: () => zoomFactor * 100 }
+});
 initUsage();
 initPlugins(apply);
 initPets(api, pet);
@@ -2498,6 +2503,9 @@ void (async () => {
   await refresh();
   // A first run has nothing set up, so open on the wizard rather than an empty Home.
   showTab(state && missingStep(state)?.step === 'folder' ? 'setup' : 'chat');
+  // What's New after a real update (#1172); a first run on the Setup wizard has nothing new to show.
+  const started = state as AppState | null;
+  if (started && missingStep(started)?.step !== 'folder') initWhatsNew(started.update.current, started.config.ui.lastSeenVersion);
   const entries = await run(api.getLog());
   const key = (entry: LogEntry): string => `${entry.time}\0${entry.level}\0${entry.agent ?? ''}\0${entry.message}`;
   const shown = new Map<string, number>();

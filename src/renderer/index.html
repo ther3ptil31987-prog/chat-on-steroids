@@ -27,16 +27,7 @@
     <div class="app" data-screen="chat">
       <div class="app-topbar">
         <button class="btn" id="sidebarToggle" type="button" aria-label="Toggle sidebar" aria-controls="sidebar" aria-expanded="true" title="Toggle sidebar"><i class="ico ph ph-sidebar-simple" aria-hidden="true"></i></button>
-        <details class="view-menu" id="viewMenu"><summary>View</summary><div class="view-menu-items">
-          <button class="btn" id="sidebarMenuToggle" type="button">Toggle Sidebar <kbd data-shortcut="B">Ctrl+B</kbd></button>
-          <button class="btn" id="searchMenuItem" type="button">Search Chats <kbd data-shortcut="K">Ctrl+K</kbd></button>
-          <hr />
-          <button class="btn" id="viewPets" type="button">Desktop Pets</button>
-          <hr />
-          <button class="btn" id="zoomIn" type="button">Zoom In <kbd data-shortcut="+">Ctrl++</kbd></button>
-          <button class="btn" id="zoomOut" type="button">Zoom Out <kbd data-shortcut="−">Ctrl+−</kbd></button>
-          <button class="btn" id="zoomActualSize" type="button">Actual Size <span id="zoomReset">100%</span><kbd data-shortcut="0">Ctrl+0</kbd></button>
-        </div></details>
+        <button class="btn" id="viewMenu" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="View" title="View"><i class="ico ph ph-list" aria-hidden="true"></i></button>
       </div>
       <aside class="sidebar" id="sidebar">
         <div class="sidebar-resize" id="sidebarResize" role="separator" tabindex="0" aria-label="Chat list width" aria-orientation="vertical" aria-controls="sidebar" title="Drag to resize · Double-click to reset"></div>
@@ -921,7 +912,7 @@
                     </span>
                     <input id="autoContinue" type="checkbox" />
                   </label>
-                  <details class="setting-timing"><summary><svg class="disclosure-chevron sum-chev" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.5 10.5 8 6 12.5"></path></svg>Recovery timing details</summary><p>Recover unfinished answers, including in Goal and Loop. Reload after 2 minutes without progress (Pro: 10). If still generating, wait 1 more minute (Pro: 5), then stop and send. A final answer selects Goal or Loop instead of Continue. Undelivered tickets share reload intervals of 2, 5, 10 and 15 minutes.</p></details>
+                  <details class="setting-timing"><summary><svg class="disclosure-chevron sum-chev" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.5 10.5 8 6 12.5"></path></svg>Recovery timing details</summary><p>Recover unfinished answers, including in Goal and Loop. Reload after 2 minutes without progress (Pro: 10). If still generating, wait 1 more minute (Pro: 5), then stop and send. A final answer selects Goal or Loop instead of Continue. Undelivered steps get at most three page reloads (after 2, 5, and 10 minutes); recovery then stops visibly while the original pending work remains saved.</p></details>
                   <div class="setting"><span class="setting-text"><b id="goalBackendTitle">Goal response source</b><em>API is the most reliable. Offline uses completion markers and 200 prepared messages.</em></span><select id="goalBackend" aria-labelledby="goalBackendTitle"><option value="chatgpt">Separate ChatGPT chat</option><option value="api">API key · Most reliable</option><option value="templates">Offline · No API cost</option></select></div>
                   <div class="setting"><span class="setting-text"><b id="loopBackendTitle">Loop response source</b><em>Loop keeps going until you switch it off.</em></span><select id="loopBackend" aria-labelledby="loopBackendTitle"><option value="api">API key · Most reliable</option><option value="chatgpt">Separate ChatGPT chat</option></select></div>
                   <div class="setting"><span class="setting-text"><b>Goal, Loop and Plan model</b><em>Model for ChatGPT-generated messages and plans. Select GPT-5.6 and High below for planning.</em></span><select id="helperModel" aria-label="Goal, Loop and Plan model"></select></div>
@@ -1337,6 +1328,23 @@
       <div class="search-dialog-results" id="searchResults" aria-live="polite"></div>
     </dialog>
 
+    <dialog class="whats-new-dialog" id="whatsNewDialog" aria-labelledby="whatsNewTitle" aria-describedby="whatsNewLead">
+      <header class="whats-new-head">
+        <!-- The app's own tile, sealed with a sparkle: the same language as the browser sign-in card. -->
+        <div class="whats-new-hero" aria-hidden="true">
+          <span class="whats-new-tile"><svg class="ico" viewBox="0 0 24 24"><use href="#i-mark" /></svg></span>
+          <span class="whats-new-seal"><i class="ico ph ph-sparkle"></i></span>
+        </div>
+        <span class="whats-new-version" id="whatsNewVersion"></span>
+        <h2 id="whatsNewTitle">What's new</h2>
+        <p class="whats-new-lead" id="whatsNewLead"></p>
+      </header>
+      <ul class="whats-new-list" id="whatsNewList"></ul>
+      <footer class="whats-new-actions">
+        <button class="whats-new-link" id="whatsNewNotes" type="button"><i class="ico ph ph-arrow-square-out" aria-hidden="true"></i>Full release notes</button>
+        <button class="whats-new-done" id="whatsNewDone" type="button">Got it</button>
+      </footer>
+    </dialog>
     <dialog id="setupProfileDialog" class="setup-profile-dialog" aria-labelledby="setupProfileDialogTitle">
       <form id="setupProfileForm">
         <h3 id="setupProfileDialogTitle">Add profile</h3>

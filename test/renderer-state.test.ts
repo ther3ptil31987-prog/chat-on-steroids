@@ -23,7 +23,7 @@ function installDialog(w: any): void {
 function rowMenuItem(row: Element, action: string): HTMLButtonElement | null {
   const doc = row.ownerDocument;
   closeRowMenus(doc);
-  (row.querySelector('.row-menu-button') as HTMLButtonElement).click();
+  (row.querySelector('[data-row-menu]') as HTMLButtonElement).click();
   return doc.querySelector<HTMLButtonElement>(`.row-menu [data-row-action="${action}"]`);
 }
 /** Closes whatever row menu is open, as Escape does. */
@@ -36,6 +36,67 @@ afterEach(() => {
   dom?.window.close();
   dom = null;
   vi.resetModules();
+});
+
+it('shows a model saved under its old short label as the model it resolves to (2.1.31 release check)', async () => {
+  // A Mac config kept the Goal model "6" from before full names. #1219 resolves it to GPT-6, but the
+  // generic settings pass then wrote the raw "6" back into the select, which matched no option, so the
+  // setting showed blank on every start and state push.
+  const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
+  dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
+  installDialog(dom.window);
+  const w = dom.window;
+  w.HTMLElement.prototype.animate = vi.fn() as any;
+  Object.assign(globalThis, { window: w, document: w.document, HTMLElement: w.HTMLElement, Element: w.Element, Node: w.Node,
+    DocumentFragment: w.DocumentFragment, HTMLInputElement: w.HTMLInputElement, HTMLSelectElement: w.HTMLSelectElement,
+    HTMLTextAreaElement: w.HTMLTextAreaElement, HTMLButtonElement: w.HTMLButtonElement });
+  if (!(w.HTMLElement.prototype as any).scrollIntoView) (w.HTMLElement.prototype as any).scrollIntoView = () => {};
+  let stateListener: (state: any) => void = () => undefined;
+  const state = {
+    config: {
+      roots: [{ name: 'repo', path: 'C:\\repo' }], readOnly: true,
+      capabilities: { browse: true, search: true, read: true, metadata: true, create: false, edit: false, move: false, deleteFile: false,
+        command: false, screen: false, control: false, clipboardRead: false, clipboardWrite: false },
+      commandAllowlist: { enabled: false, mode: 'allow' as const, rules: [] as string[] },
+      tunnel: { kind: 'openai', tunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', desktopTunnelId: '', binaryPath: '' },
+      ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'light', defaultChatModel: '5.6', defaultChatReasoning: 'high' },
+      sessions: { record: true, retainDays: 30, advisoryTokens: 300000, limitTokens: 400000 },
+      compaction: { auto: true, autoTokens: 300000, handoffPrompt: DEFAULT_HANDOFF_PROMPT },
+      multiAgent: { enabled: false, maxWorkers: 2, globalMaxWorkers: 0, allowUnattributedCalls: false, recoverAgentTabs: true, defaultModel: '6', defaultReasoning: 'high' },
+      goal: { enabled: false, model: 'deepseek/deepseek-v4-flash', reasoning: 'default' as const, prompt: DEFAULT_GOAL_SYSTEM_PROMPT,
+        helperModel: '6', helperReasoning: 'high' }
+    },
+    status: { state: 'disconnected', detail: '', publicUrl: null, localUrl: null, handshakeAt: null, lastRequestAt: null, lastToolCallAt: null, health: null, surfaces: [] },
+    hasApiKey: false, hasGoalKey: false, resolvedBinary: null, bundledTunnelVersion: null,
+    bridge: { running: true, port: 8765, paired: false, present: false, lastSeenAt: null, extensionVersion: null },
+    update: { current: '2.1.31', latest: null, stage: 'idle', error: null, checkedAt: null }
+  };
+  const models = [
+    { id: 'gpt-6', label: 'GPT-6', efforts: ['none', 'medium', 'high', 'xhigh'], aliases: ['gpt-6', 'gpt-6-thinking'] },
+    { id: 'gpt-5-6', label: 'GPT-5.6', efforts: ['none', 'medium', 'high', 'xhigh'] }];
+  const ok = (data: any) => Promise.resolve({ ok: true, data });
+  const api: any = new Proxy({
+    getState: () => ok(state),
+    getLog: () => ok([]),
+    getSwarm: () => ok({ running: false, runId: null, agents: [], maxWorkers: 2, pendingReports: 0 }),
+    getChatModels: () => ok({ state: 'ready', requestedAt: 1, observedAt: Date.now(), models }),
+    onStateChanged: (fn: any) => { stateListener = fn; return () => undefined; },
+    onLogEntry: () => () => undefined,
+    onSwarmChanged: () => () => undefined,
+    onSessionChanged: () => () => undefined,
+    listSessions: () => ok({ sessions: [], activeId: null, pressure: [] })
+  }, { get(target, prop) { if (prop in target) return (target as any)[prop]; return (..._args: any[]) => ok(null); } });
+  Object.defineProperty(w, 'api', { value: api, configurable: true });
+
+  await import('../src/renderer/main.js');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const value = (id: string) => (w.document.getElementById(id) as HTMLSelectElement).value;
+  const shown = () => ({ helper: value('helperModel'), worker: value('workerModel'), chat: value('defaultChatModel') });
+  expect(shown()).toEqual({ helper: 'gpt-6', worker: 'gpt-6', chat: 'gpt-5-6' });
+  stateListener(structuredClone(state));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(shown()).toEqual({ helper: 'gpt-6', worker: 'gpt-6', chat: 'gpt-5-6' });
+  expect(value('helperReasoning')).toBe('high');
 });
 
 it('does not overwrite a focused dirty settings field on an unsolicited state push', async () => {
@@ -510,7 +571,12 @@ it('starts project groups collapsed and deliberately expands the project selecte
   const group = () => mounted.window.document.querySelector<HTMLDetailsElement>(`[data-project-id="${project.id}"]`)!;
   await vi.waitFor(() => expect(group()).not.toBeNull());
   expect(group().open).toBe(false);
-  rowMenuItem(group().querySelector('.project-heading')!, 'new-chat')!.click();
+  // A new chat is the row's own button, beside its menu, not an item inside it.
+  expect(rowMenuItem(group().querySelector('.project-heading')!, 'new-chat')).toBeNull();
+  const create = group().querySelector<HTMLButtonElement>('.project-heading > .project-new')!;
+  expect(create.getAttribute('aria-label')).toBe('New chat in this project');
+  expect(create.nextElementSibling?.classList.contains('project-menu')).toBe(true);
+  create.click();
   expect(group().open).toBe(true);
 });
 
@@ -1648,9 +1714,60 @@ it('ends Setup on Ready, which names what is still open and leads back to it', a
   expect(doc.getElementById('readyStart')!.hidden).toBe(true);
   const pending = [...doc.querySelectorAll<HTMLButtonElement>('#readyChecks .ready-go')];
   expect(pending.length).toBeGreaterThan(0);
-  expect(pending.map(button => button.textContent)).toContain('Step 4API key stored');
+  expect(pending.map(button => button.textContent)).toContain('Step 5API key stored');
   pending.find(button => button.textContent!.includes('API key'))!.click();
   expect(doc.querySelector('[data-step="key"]')!.classList.contains('is-open')).toBe(true);
+});
+
+it('asks what ChatGPT can do in Setup, and read-only keeps it open with the reason', async () => {
+  const mounted = await mountChat();
+  const doc = mounted.window.document;
+  const access = doc.querySelector<HTMLElement>('[data-step="access"]')!;
+  const choice = (level: string) => doc.querySelector<HTMLButtonElement>(`[data-access="${level}"]`)!;
+
+  // The fixture shares a folder with every permission on: the step is done, on Full access.
+  expect(access.classList.contains('is-done')).toBe(true);
+  expect(choice('full').getAttribute('aria-checked')).toBe('true');
+  expect(doc.getElementById('accessNote')!.hidden).toBe(true);
+
+  // Read-only, as an older install or a recovered settings file leaves it: the step is done (setup
+  // can still end on all set), but it says why, and Ready says what is limited and how to change it.
+  const readOnly = structuredClone(mounted.state);
+  readOnly.config.readOnly = true;
+  readOnly.settingsRecovered = true;
+  mounted.push(readOnly);
+  expect(access.classList.contains('is-done')).toBe(true);
+  expect(choice('read').getAttribute('aria-checked')).toBe('true');
+  expect(doc.getElementById('accessRecovered')!.hidden).toBe(false);
+  expect(doc.getElementById('accessNote')!.classList.contains('is-warn')).toBe(true);
+  expect(doc.getElementById('readyLimited')!.hidden).toBe(false);
+  expect(doc.querySelector('#readyChecks .ready-check.is-passed.is-limited')!.textContent).toBe('ChatGPT can only read files');
+  doc.getElementById('readyChangeAccess')!.click();
+  expect(access.classList.contains('is-open')).toBe(true);
+
+  // Files and terminal turns read-only off and Desktop off in one save.
+  choice('files').click();
+  await settle();
+  const saved = mounted.calls.at(-1);
+  expect(saved.readOnly).toBe(false);
+  for (const cap of ['create', 'edit', 'move', 'deleteFile', 'command']) expect(saved.capabilities[cap], cap).toBe(true);
+  for (const cap of ['screen', 'control', 'clipboardRead', 'clipboardWrite']) expect(saved.capabilities[cap], cap).toBe(false);
+
+  // An unpublished Desktop card leads to the same step, not to Settings.
+  const noDesktop = structuredClone(mounted.state);
+  noDesktop.status.surfaces = [{ id: 'desktop', connectorName: 'Chat On Steroids Desktop', state: 'off', available: false, optional: true,
+    detail: 'Turn on a Desktop permission.', cardSummary: 'Browser and desktop apps.', tools: [], lastRequestAt: null, lastToolCallAt: null }];
+  mounted.push(noDesktop);
+  [...doc.querySelectorAll<HTMLButtonElement>('#connectorCards .btn')].find(button => button.textContent === 'Change access')!.click();
+  expect(access.classList.contains('is-open')).toBe(true);
+
+  // A mix from Workspace without commands is custom, and named as what keeps ChatGPT from working.
+  const custom = structuredClone(mounted.state);
+  custom.config.capabilities.command = false;
+  mounted.push(custom);
+  for (const level of ['full', 'files', 'read']) expect(choice(level).getAttribute('aria-checked')).toBe('false');
+  expect(doc.getElementById('readyLimited')!.hidden).toBe(false);
+  expect(doc.getElementById('accessNote')!.textContent).toMatch(/^These permissions keep ChatGPT from editing files or running commands/);
 });
 
 it('requires external installation before choosing the built-in browser and signing in', async () => {
@@ -2030,7 +2147,7 @@ it('keeps folder access discoverable after setup and navigates without granting 
   // A finished setup leads with its proof: every check passed, and the way into a chat.
   expect(doc.getElementById('readyTitle')!.textContent).toBe('You’re all set!');
   expect(doc.getElementById('readyStart')!.hidden).toBe(false);
-  expect(doc.querySelectorAll('#readyChecks .ready-check.is-passed')).toHaveLength(6);
+  expect(doc.querySelectorAll('#readyChecks .ready-check.is-passed')).toHaveLength(7);
   expect(mounted.window.getComputedStyle(doc.getElementById('readyChecks')!).display).not.toBe('none');
   doc.querySelector<HTMLButtonElement>('[data-rail-step="folder"]')!.click();
   const manage = doc.getElementById('wizManageFolders')!;
@@ -2669,7 +2786,7 @@ it('gives twenty rapid New Chat sends independent visible local chats before any
   const setSessionAutomation = vi.fn();
   const mounted = await mountChat({}, [], { sendInput, setInputAutomation, setSessionAutomation,
     getChatModels: async () => ok({ state: 'ready', requestedAt: 1, observedAt: Date.now(), models: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', efforts: ['high'] }] }),
-    listInputs: async () => ok([...rows]), runningTools: async () => ok([]), livePreview: async () => ok(null), listPausedHelpers: async () => ok([]),
+    listInputs: async () => ok([...rows]), runningTools: async () => ok([]), turnTraces: async () => ok({}), listPausedHelpers: async () => ok([]),
     listSessions: async () => ok({ sessions: [...summaries], activeId: null, pressure: [] }),
     getSession: async (id: string) => ok({ summary: summaries.find(row => row.id === id), events: [], nextCursor: null })
   });
@@ -2728,7 +2845,7 @@ it('shows the frozen Auto-selected Skill receipt for an accepted ordinary send',
     getChatModels: async () => ok({ state: 'ready', requestedAt: 1, observedAt: Date.now(), models: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', efforts: ['high'] }] }),
     listInputs: async () => ok([...rows]),
     runningTools: async () => ok([]),
-    livePreview: async () => ok(null),
+    turnTraces: async () => ok({}),
     listPausedHelpers: async () => ok([]),
     listSessions: async () => ok({ sessions: [...summaries], activeId: null, pressure: [] }),
     getSession: async (id: string) => ok({ summary: summaries.find(row => row.id === id), events: [], nextCursor: null })
@@ -2753,7 +2870,7 @@ it('does not steal a newer New Chat draft when an older admission response arriv
   }; }));
   const mounted = await mountChat({}, [], { sendInput,
     getChatModels: async () => ok({ state: 'ready', requestedAt: 1, observedAt: Date.now(), models: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', efforts: ['high'] }] }),
-    listInputs: async () => ok([...rows]), runningTools: async () => ok([]), livePreview: async () => ok(null), listPausedHelpers: async () => ok([]),
+    listInputs: async () => ok([...rows]), runningTools: async () => ok([]), turnTraces: async () => ok({}), listPausedHelpers: async () => ok([]),
     listSessions: async () => ok({ sessions: [...summaries], activeId: null, pressure: [] }),
     getSession: async (id: string) => ok({ summary: summaries.find(row => row.id === id), events: [], nextCursor: null })
   });

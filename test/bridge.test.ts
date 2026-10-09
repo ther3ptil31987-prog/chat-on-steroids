@@ -1085,33 +1085,35 @@ describe('active agent tab discard projection', () => {
   });
 });
 
-describe('the running turn\'s caption (#942)', () => {
-  it('holds the newest unpublished sentence in memory and drops it when cleared or the page closes', async () => {
-    const { livePreview } = await import('../src/main/live-preview.js');
+describe('a turn\'s round outline (#942)', () => {
+  it('stores the newest outline of a turn beside its log, never as an event', async () => {
+    const { readTurnTraces, readEvents } = await import('../src/main/session/store.js');
     await pair();
-    const conversationId = 'f0f00942-1111-4111-8111-111111111111', other = 'f0f00942-1111-4111-8111-222222222222';
-    const send = (body: unknown) => request('POST', '/live-preview', { body });
-    expect((await send({ conversationId, text: 'First command printed one.' })).status).toBe(200);
-    expect(livePreview([other, conversationId])).toBe('First command printed one.');
-    expect(livePreview([other])).toBeNull();
-    expect((await send({ conversationId, text: null })).status).toBe(200);
-    expect(livePreview([conversationId])).toBeNull();
-    // Bounded and exact: one caption line, nothing else accepted.
-    for (const bad of [{ conversationId, text: 'x'.repeat(301) }, { conversationId, text: '' }, { conversationId },
-      { conversationId, text: 'ok', extra: true }, { conversationId: 'not a chat', text: 'ok' }]) {
-      expect((await send(bad)).status, JSON.stringify(bad).slice(0, 60)).toBe(400);
-    }
-    expect(livePreview([conversationId])).toBeNull();
-    await send({ conversationId, text: 'Second command printed two.' });
-    await request('POST', '/closed', { body: { conversationId, manual: true } });
-    expect(livePreview([conversationId])).toBeNull();
-  });
-
-  it('forgets a caption nobody refreshed for ten minutes', async () => {
-    const { livePreview, setLivePreview } = await import('../src/main/live-preview.js');
-    setLivePreview('f0f00942-1111-4111-8111-333333333333', 'Still going', 1_000);
-    expect(livePreview(['f0f00942-1111-4111-8111-333333333333'], 1_000 + 10 * 60_000)).toBe('Still going');
-    expect(livePreview(['f0f00942-1111-4111-8111-333333333333'], 1_001 + 10 * 60_000)).toBeNull();
+    const conversationId = 'f0f00942-1111-4111-8111-111111111111';
+    const post = (events: unknown[]) => request('POST', '/events', { body: { conversationId, events } });
+    const opened = await post([{ kind: 'user_message', time: Date.now(), text: 'Run three commands', messageId: 'q-942' }]);
+    const sessionId = opened.body.sessionId as string;
+    const before = (await readEvents(sessionId, { from: 0, limit: 1000 })).length;
+    const outline = [
+      { kind: 'say', text: 'First command printed one.', done: true },
+      { kind: 'call', id: 'call-1', tool: 'exec_command', done: true, at: 1_791_000_000_000 },
+      { kind: 'recap', text: 'Ran the first command' }
+    ];
+    expect((await post([{ kind: 'turn_trace', time: Date.now(), turnId: 'g-942-0-1', trace: outline }])).status).toBe(200);
+    await vi.waitFor(async () => expect((await readTurnTraces(sessionId, ['g-942-0-1']))['g-942-0-1']).toEqual(outline));
+    // The newest outline replaces the turn's; anything the page cannot vouch for is dropped.
+    await post([{ kind: 'turn_trace', time: Date.now(), turnId: 'g-942-0-1',
+      trace: [...outline, { kind: 'say', text: 'Second.', done: false }, { kind: 'mystery', text: 'x' }, { kind: 'call', tool: 'read' }] }]);
+    await vi.waitFor(async () => expect((await readTurnTraces(sessionId, ['g-942-0-1']))['g-942-0-1']).toEqual(
+      [...outline, { kind: 'say', text: 'Second.', done: false }]));
+    // A page reloaded since the turn ran reads the same calls without when they first showed; that is kept.
+    await post([{ kind: 'turn_trace', time: Date.now(), turnId: 'g-942-0-1',
+      trace: [outline[0], { kind: 'call', id: 'call-1', tool: 'exec_command', done: true }, outline[2]] }]);
+    await vi.waitFor(async () => expect((await readTurnTraces(sessionId, ['g-942-0-1']))['g-942-0-1']).toEqual(outline));
+    // An outline without a turn to file it under is not stored anywhere.
+    await post([{ kind: 'turn_trace', time: Date.now(), trace: outline }]);
+    expect((await readEvents(sessionId, { from: 0, limit: 1000 })).length).toBe(before);
+    expect(JSON.stringify(await readEvents(sessionId, { from: 0, limit: 1000 }))).not.toContain('First command printed one.');
   });
 });
 
@@ -3423,6 +3425,44 @@ describe('capturing a sent handoff from the recorder', () => {
     const handoffId = continuationByToken(token)?.handoffId;
     expect(handoffId).toBeTruthy();
     expect((await sessionStoreModule.readHandoff(sessionId, handoffId!))?.text).toContain('carry on');
+  });
+
+  it('keeps over 120 KB of a final handoff through /events, overflow storage and capture', async () => {
+    await pair();
+    const conversationId = 'c0c0c0c0-7870-4000-8000-000000000005';
+    const { token, sessionId, anchor } = await sentHandoff(conversationId);
+    const brief = `TASK: Synthetic large handoff\n${'Do not lose any step. '.repeat(7_000)}\nEND_OF_BRIEF`;
+    const renderedHtml = `<div>${brief.replace(/\n/g, '<br>')}</div>`;
+    expect(brief.length).toBeGreaterThan(120_000);
+    expect(renderedHtml.length).toBeLessThan(256_000);
+    const recorded = await request('POST', '/events', { body: { conversationId, events: [
+      { kind: 'turn_start', time: Date.now(), turnId: 'long-handoff-turn' },
+      { kind: 'assistant_message', time: Date.now(), turnId: 'long-handoff-turn', messageId: 'long-handoff-final',
+        text: brief, renderedHtml, state: 'final', final: true },
+      { kind: 'turn_end', time: Date.now(), turnId: 'long-handoff-turn', outcome: 'completed' }
+    ] } });
+    expect(recorded.status).toBe(200);
+    const event = (await readEvents(sessionId, { kinds: ['assistant_message'] })).find(
+      row => row.kind === 'assistant_message' && row.messageId === 'long-handoff-final');
+    expect(event?.kind).toBe('assistant_message');
+    if (!event || event.kind !== 'assistant_message') throw new Error('The long final was not recorded');
+    expect(event.message.truncated).toBe(false);
+    expect(event.message.text).toBe(brief);
+    expect(event.renderedHtml?.truncated).toBe(true);
+    expect(await sessionStoreModule.readOverflowText(sessionId, event.renderedHtml!.assetId!)).toContain('END_OF_BRIEF');
+
+    const bound = await request('POST', '/compact', { body: { conversationId, token, sourceMessageId: anchor } });
+    expect(bound.status).toBe(200);
+    expect(bound.body.stored).toBe(true);
+    const handoffId = continuationByToken(token)?.handoffId;
+    expect(handoffId).toBeTruthy();
+    const saved = await sessionStoreModule.readHandoff(sessionId, handoffId!);
+    // The replacement ChatGPT prompt deliberately has a 96k character ceiling.
+    // Its handoff formatter removes the middle, but preserves the last actions.
+    expect(saved?.text).toContain('TASK: Synthetic large handoff');
+    expect(saved?.text).toContain('… the middle of this brief was longer');
+    expect(saved?.text.length).toBeLessThanOrEqual(96_000);
+    expect(saved?.text.endsWith('END_OF_BRIEF')).toBe(true);
   });
 
   it('refuses a later Retry final that reused the same handoff user message', async () => {
